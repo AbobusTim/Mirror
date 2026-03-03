@@ -14,6 +14,15 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 from dotenv import load_dotenv
 from loguru import logger
 from telethon import TelegramClient
+from telethon.errors import (
+    ApiIdInvalidError,
+    FloodWaitError,
+    PhoneNumberBannedError,
+    PhoneNumberFloodError,
+    PhoneNumberInvalidError,
+    PhoneNumberUnoccupiedError,
+    RpcCallFailError,
+)
 from telethon.sessions import StringSession
 
 from src.channel_manager import ChannelManager
@@ -140,7 +149,8 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
         f"📜 /list — список зеркал\n"
         f"🗑 /remove — удалить зеркало\n"
         f"🔘 /toggle — вкл/выкл зеркало\n"
-        f"🔧 /setup — изменить API",
+        f"🔧 /setup — изменить API (SMS)\n"
+        f"⚡ /session — быстрая настройка",
         parse_mode=ParseMode.HTML,
         reply_markup=get_main_menu_keyboard(bool(bridges)),
     )
@@ -215,8 +225,7 @@ async def process_phone(message: types.Message, state: FSMContext) -> None:
     api_id = data["api_id"]
     api_hash = data["api_hash"]
     
-    # Save credentials
-    save_user_credentials(message.from_user.id, api_id, api_hash, phone)
+    loading_msg = await message.answer(f"{EMOJI['loading']} Отправка кода...")
     
     # Start client and send code
     client = TelegramClient(StringSession(), api_id, api_hash)
@@ -224,18 +233,99 @@ async def process_phone(message: types.Message, state: FSMContext) -> None:
     
     try:
         sent_code = await client.send_code_request(phone)
+        # Save credentials only after successful code send
+        save_user_credentials(message.from_user.id, api_id, api_hash, phone)
         await state.update_data(phone=phone, phone_code_hash=sent_code.phone_code_hash)
-        await message.answer(
+        await loading_msg.edit_text(
             f"{EMOJI['loading']} <b>Код отправлен!</b>\n\n"
             f"Введите код подтверждения из SMS/Telegram:\n\n"
             f"<i>Формат: 12345</i>",
             parse_mode=ParseMode.HTML,
         )
         await state.set_state(SetupStates.waiting_for_code)
+        
+    except ApiIdInvalidError:
+        logger.error(f"Invalid API_ID for user {message.from_user.id}: {api_id}")
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Неверный API_ID или API_HASH!</b>\n\n"
+            f"Проверьте:\n"
+            f"• API_ID должен быть числом из https://my.telegram.org\n"
+            f"• API_HASH должен быть строкой из той же страницы\n"
+            f"• Не используйте API из примеров\n\n"
+            f"Начните заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        
+    except PhoneNumberInvalidError:
+        logger.error(f"Invalid phone for user {message.from_user.id}: {phone}")
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Неверный номер телефона!</b>\n\n"
+            f"Формат: +79123456789\n"
+            f"Убедитесь, что номер зарегистрирован в Telegram.\n\n"
+            f"Начните заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        
+    except PhoneNumberBannedError:
+        logger.error(f"Banned phone for user {message.from_user.id}: {phone}")
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Номер заблокирован!</b>\n\n"
+            f"Этот номер телефона забанен в Telegram.\n"
+            f"Используйте другой номер.\n\n"
+            f"Начните заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        
+    except PhoneNumberFloodError as e:
+        logger.error(f"Phone flood for user {message.from_user.id}: {e}")
+        seconds = getattr(e, 'seconds', 3600)
+        minutes = seconds // 60
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Слишком много попыток!</b>\n\n"
+            f"На этот номер отправлено слишком много кодов.\n"
+            f"Подождите {minutes} минут и попробуйте снова.\n\n"
+            f"Начните заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        
+    except FloodWaitError as e:
+        logger.error(f"Flood wait for user {message.from_user.id}: {e}")
+        seconds = getattr(e, 'seconds', 3600)
+        minutes = seconds // 60
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Лимит запросов!</b>\n\n"
+            f"Слишком много запросов к Telegram API.\n"
+            f"Подождите {minutes} минут и попробуйте снова.\n\n"
+            f"Начните заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        
+    except RpcCallFailError as e:
+        logger.error(f"RPC error for user {message.from_user.id}: {e}")
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Ошибка Telegram API!</b>\n\n"
+            f"Возможные причины:\n"
+            f"• Неверный API_ID/API_HASH\n"
+            f"• IP адрес в бане\n"
+            f"• Временные проблемы Telegram\n\n"
+            f"Попробуйте позже или используйте другой API.\n"
+            f"Начните заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        
     except Exception as e:
-        await message.answer(
-            f"{EMOJI['error']} Ошибка отправки кода: {e}\n\n"
-            "Начните заново: /start",
+        logger.exception(f"Error sending code for user {message.from_user.id}")
+        error_msg = str(e)
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Ошибка отправки кода:</b>\n\n"
+            f"<code>{error_msg}</code>\n\n"
+            f"Начните заново: /setup",
             parse_mode=ParseMode.HTML,
         )
         await state.clear()
@@ -245,13 +335,27 @@ async def process_phone(message: types.Message, state: FSMContext) -> None:
 
 @dp.message(SetupStates.waiting_for_code)
 async def process_code(message: types.Message, state: FSMContext) -> None:
-    code = message.text.strip()
+    # Clean code: remove spaces, dashes, and any non-digit characters
+    raw_code = message.text.strip()
+    code = ''.join(filter(str.isdigit, raw_code))
+    
+    logger.info(f"Processing code for user {message.from_user.id}: length={len(code)}")
+    
     data = await state.get_data()
     
-    api_id = data["api_id"]
-    api_hash = data["api_hash"]
-    phone = data["phone"]
+    api_id = data.get("api_id")
+    api_hash = data.get("api_hash")
+    phone = data.get("phone")
     phone_code_hash = data.get("phone_code_hash")
+    
+    if not all([api_id, api_hash, phone, phone_code_hash]):
+        await message.answer(
+            f"{EMOJI['error']} <b>Сессия устарела!</b>\n\n"
+            "Начните настройку заново: /setup",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
+        return
     
     client = TelegramClient(StringSession(), api_id, api_hash)
     await client.connect()
@@ -276,11 +380,34 @@ async def process_code(message: types.Message, state: FSMContext) -> None:
         await state.clear()
         
     except Exception as e:
-        await message.answer(
-            f"{EMOJI['error']} Ошибка верификации: {e}\n\n"
-            "Проверьте код и попробуйте снова.",
-            parse_mode=ParseMode.HTML,
-        )
+        error_msg = str(e)
+        logger.error(f"Sign in error for user {message.from_user.id}: {error_msg}")
+        
+        if "PHONE_CODE_INVALID" in error_msg:
+            await message.answer(
+                f"{EMOJI['error']} <b>Неверный код!</b>\n\n"
+                f"Вы ввели: <code>{raw_code}</code> (очищено: <code>{code}</code>)\n\n"
+                f"Проверьте:\n"
+                f"• Код из <b>SMS</b> или <b>Telegram</b> (не из 2FA!)\n"
+                f"• Введите только цифры без пробелов\n"
+                f"• Код действителен 2 минуты\n\n"
+                f"Попробуйте снова или начните заново /setup",
+                parse_mode=ParseMode.HTML,
+            )
+        elif "PHONE_CODE_EXPIRED" in error_msg:
+            await message.answer(
+                f"{EMOJI['error']} <b>Код истек!</b>\n\n"
+                f"Код действует 2 минуты. Начните заново: /setup",
+                parse_mode=ParseMode.HTML,
+            )
+            await state.clear()
+        else:
+            await message.answer(
+                f"{EMOJI['error']} <b>Ошибка:</b> {error_msg}\n\n"
+                f"Начните заново: /setup",
+                parse_mode=ParseMode.HTML,
+            )
+            await state.clear()
     finally:
         await client.disconnect()
 
@@ -396,10 +523,24 @@ async def create_bridge(message: types.Message, state: FSMContext) -> None:
         
         await loading_msg.edit_text(f"{EMOJI['loading']} Создание {EMOJI['mirror']} зеркала...")
         
-        internal_id, target_id, target_title = await manager.create_target_for_source(
-            source_title, source_type
-        )
+        result = await manager.create_target_for_source(source_title, source_type)
         
+        if not result:
+            await loading_msg.edit_text(
+                f"{EMOJI['error']} <b>Не удалось создать зеркало!</b>\n\n"
+                f"Возможные причины:\n"
+                f"• Нет прав на создание каналов\n"
+                f"• Flood limits (подождите 1-2 минуты)\n"
+                f"• Ошибка API\n\n"
+                f"Попробуйте снова позже.",
+                parse_mode=ParseMode.HTML,
+            )
+            await client.disconnect()
+            await state.clear()
+            return
+        
+        internal_id, target_id, target_title = result
+
         bridge_id = add_bridge(
             user_id=user_id,
             source_id=source_id,
@@ -613,6 +754,159 @@ async def cb_help(callback: types.CallbackQuery) -> None:
         "Фильтр сообщений. Например: btc,eth — только сообщения с этими словами.",
         parse_mode=ParseMode.HTML,
     )
+
+
+# Session string direct input
+class SessionStates(StatesGroup):
+    waiting_for_api_id_session = State()
+    waiting_for_api_hash_session = State()
+    waiting_for_session_string = State()
+
+
+@dp.message(Command("session"))
+async def cmd_session(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        f"{EMOJI['mirror']} <b>Быстрая настройка через SESSION_STRING</b>\n\n"
+        "Этот способ быстрее — не нужно ждать SMS код.\n\n"
+        "<b>Как получить SESSION_STRING:</b>\n"
+        "1️⃣ Откройте Python на любом устройстве\n"
+        "2️⃣ Выполните:\n"
+        "<code>python -c \"from telethon.sync import TelegramClient; from telethon.sessions import StringSession; print(StringSession().save())\"</code>\n\n"
+        "3️⃣ Введите API_ID, API_HASH, телефон\n"
+        "4️⃣ Код придет в Telegram (не SMS!) — введите его\n"
+        "5️⃣ Скопируйте длинную строку — это SESSION_STRING\n\n"
+        "Готовы продолжить?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, ввести данные", callback_data="session_start")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "session_start")
+async def cb_session_start(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text(
+        "🔧 <b>Ввод SESSION_STRING</b> — Шаг 1/3\n\n"
+        "Введите ваш <b>API_ID</b>\n\n"
+        "<i>Число, например: 12345678</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(SessionStates.waiting_for_api_id_session)
+
+
+@dp.message(SessionStates.waiting_for_api_id_session)
+async def process_session_api_id(message: types.Message, state: FSMContext) -> None:
+    try:
+        api_id = int(message.text.strip())
+        await state.update_data(api_id=api_id)
+        await message.answer(
+            "🔧 <b>Ввод SESSION_STRING</b> — Шаг 2/3\n\n"
+            "Введите ваш <b>API_HASH</b>\n\n"
+            "<i>Строка из букв и цифр</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.set_state(SessionStates.waiting_for_api_hash_session)
+    except ValueError:
+        await message.answer(
+            f"{EMOJI['error']} API_ID должен быть числом!\n"
+            "Попробуйте снова:",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+@dp.message(SessionStates.waiting_for_api_hash_session)
+async def process_session_api_hash(message: types.Message, state: FSMContext) -> None:
+    api_hash = message.text.strip()
+    if len(api_hash) < 10:
+        await message.answer(
+            f"{EMOJI['error']} API_HASH слишком короткий!\n"
+            "Попробуйте снова:",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    
+    await state.update_data(api_hash=api_hash)
+    await message.answer(
+        "🔧 <b>Ввод SESSION_STRING</b> — Шаг 3/3\n\n"
+        "Вставьте ваш <b>SESSION_STRING</b>\n\n"
+        "<i>Это длинная строка из букв и цифр, которую вы получили через Python</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(SessionStates.waiting_for_session_string)
+
+
+@dp.message(SessionStates.waiting_for_session_string)
+async def process_session_string(message: types.Message, state: FSMContext) -> None:
+    session_string = message.text.strip()
+    
+    if len(session_string) < 50:
+        await message.answer(
+            f"{EMOJI['error']} SESSION_STRING слишком короткая!\n\n"
+            "Обычно она длинная (200+ символов).\n"
+            "Проверьте, что скопировали всё.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    
+    data = await state.get_data()
+    api_id = data["api_id"]
+    api_hash = data["api_hash"]
+    user_id = message.from_user.id
+    
+    # Test the session
+    loading_msg = await message.answer(f"{EMOJI['loading']} Проверка сессии...")
+    
+    try:
+        client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            await loading_msg.edit_text(
+                f"{EMOJI['error']} <b>Сессия недействительна!</b>\n\n"
+                "Создайте новую сессию через Python.\n"
+                "Убедитесь, что ввели правильный API_ID и API_HASH.",
+                parse_mode=ParseMode.HTML,
+            )
+            await client.disconnect()
+            await state.clear()
+            return
+        
+        me = await client.get_me()
+        phone = me.phone or "unknown"
+        
+        # Save credentials
+        save_user_credentials(user_id, api_id, api_hash, phone)
+        save_session_string(user_id, session_string)
+        
+        await client.disconnect()
+        
+        await loading_msg.edit_text(
+            f"{EMOJI['success']} <b>API настроен успешно!</b>\n\n"
+            f"Аккаунт: {me.first_name} {me.lastname or ''}\n"
+            f"Телефон: +{phone}\n\n"
+            f"Теперь можно создавать зеркала!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"➕ {EMOJI['mirror']} Создать зеркало", callback_data="create_bridge")],
+                [InlineKeyboardButton(text="📜 Список команд", callback_data="help")],
+            ]),
+        )
+        await state.clear()
+        
+    except Exception as e:
+        logger.exception("Session validation error")
+        await loading_msg.edit_text(
+            f"{EMOJI['error']} <b>Ошибка проверки сессии:</b>\n\n"
+            f"<code>{e}</code>\n\n"
+            f"Проверьте:\n"
+            f"• Правильность API_ID и API_HASH\n"
+            f"• SESSION_STRING скопирован полностью\n"
+            f"• Сессия не устарела",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.clear()
 
 
 async def main() -> None:
