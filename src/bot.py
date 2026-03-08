@@ -1,8 +1,9 @@
-"""Management bot for Telegram Group Bridge."""
+"""MIRROR Bot - Full button navigation with session management."""
 
 import asyncio
 import os
 from typing import Any
+from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
@@ -10,7 +11,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 from loguru import logger
 from telethon import TelegramClient
@@ -20,7 +21,6 @@ from telethon.errors import (
     PhoneNumberBannedError,
     PhoneNumberFloodError,
     PhoneNumberInvalidError,
-    PhoneNumberUnoccupiedError,
     RpcCallFailError,
 )
 from telethon.sessions import StringSession
@@ -28,13 +28,18 @@ from telethon.sessions import StringSession
 from src.channel_manager import ChannelManager
 from src.database import (
     add_bridge,
+    create_session,
     delete_bridge,
+    delete_session,
+    get_active_bridges,
+    get_all_bridges,
+    get_first_session,
+    get_session,
     get_user_bridges,
-    get_user_credentials,
-    has_user_session,
+    get_user_sessions,
+    has_any_session,
     init_db,
-    save_session_string,
-    save_user_credentials,
+    migrate_old_user_data,
     toggle_bridge,
 )
 
@@ -44,7 +49,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required in .env")
 
-# Emoji
 EMOJI = {
     "welcome": "🪞",
     "success": "✨",
@@ -58,428 +62,637 @@ EMOJI = {
     "inactive": "🔴",
     "key": "🔑",
     "all": "📄",
+    "account": "👤",
+    "back": "⬅️",
+    "home": "🏠",
+    "add": "➕",
+    "settings": "⚙️",
 }
 
-# States for API setup
-class SetupStates(StatesGroup):
+# States
+class MenuStates(StatesGroup):
+    main = State()
+    session_menu = State()
+    session_detail = State()
+    bridge_menu = State()
+    bridge_detail = State()
+    creating_bridge = State()
+    selecting_session = State()
+
+
+class QrStates(StatesGroup):
     waiting_for_api_id = State()
     waiting_for_api_hash = State()
-    waiting_for_phone = State()
-    waiting_for_code = State()
 
 
-# States for bridge creation
-class BridgeStates(StatesGroup):
-    waiting_for_source = State()
-    waiting_for_keywords_choice = State()
-    waiting_for_keywords = State()
+class BridgeCreateStates(StatesGroup):
+    selecting_account = State()
+    selecting_type = State()
+    entering_source = State()
+    selecting_filter = State()
+    entering_keywords = State()
 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+active_qr_sessions: dict[int, dict[str, Any]] = {}
 
 
-# Keyboards
+# ==================== KEYBOARDS ====================
 
-def get_setup_keyboard():
+def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔧 Настроить API", callback_data="setup_api")],
+        [InlineKeyboardButton(text=f"{EMOJI['add']} Добавить аккаунт", callback_data="add_account")],
+        [InlineKeyboardButton(text=f"{EMOJI['account']} Мои аккаунты", callback_data="my_accounts")],
+        [InlineKeyboardButton(text=f"{EMOJI['mirror']} Мои зеркала", callback_data="my_bridges_menu")],
+        [InlineKeyboardButton(text=f"{EMOJI['add']} Создать зеркало", callback_data="create_bridge")],
+        [InlineKeyboardButton(text=f"{EMOJI['settings']} Помощь", callback_data="help")],
     ])
 
 
-def get_keywords_choice_keyboard():
+def back_keyboard(callback_data="main_menu"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"{EMOJI['all']} Без ключевых слов", callback_data="keywords_none"),
-            InlineKeyboardButton(text=f"{EMOJI['key']} С ключевыми словами", callback_data="keywords_yes"),
-        ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data=callback_data)],
     ])
 
 
-def get_main_menu_keyboard(has_bridges: bool = False):
-    buttons = [
-        [InlineKeyboardButton(text=f"➕ {EMOJI['mirror']} Создать зеркало", callback_data="create_bridge")],
-    ]
-    if has_bridges:
-        buttons.append([InlineKeyboardButton(text="📜 Мои зеркала", callback_data="list_bridges")])
-    buttons.append([InlineKeyboardButton(text="❓ Помощь", callback_data="help")])
+def session_list_keyboard(sessions, with_create_bridge=False):
+    buttons = []
+    for s in sessions:
+        text = f"{s.label} (+{s.phone})"
+        callback = f"session_detail:{s.session_id}"
+        if with_create_bridge:
+            callback = f"select_session_for_bridge:{s.session_id}"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=callback)])
+    buttons.append([InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# Helper functions
-
-async def get_user_client(user_id: int) -> TelegramClient | None:
-    creds = get_user_credentials(user_id)
-    if not creds or not creds.session_string:
-        return None
-    
-    client = TelegramClient(
-        StringSession(creds.session_string),
-        creds.api_id,
-        creds.api_hash,
-    )
-    return client
+def session_detail_keyboard(session_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{EMOJI['mirror']} Зеркала этого акка", callback_data=f"session_bridges:{session_id}")],
+        [InlineKeyboardButton(text=f"{EMOJI['add']} Создать зеркало", callback_data=f"create_bridge_with_session:{session_id}")],
+        [InlineKeyboardButton(text="📋 Получить session string", callback_data=f"get_session_string:{session_id}")],
+        [InlineKeyboardButton(text=f"{EMOJI['deleted']} Удалить аккаунт", callback_data=f"delete_session:{session_id}")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="my_accounts")],
+    ])
 
 
-# Handlers
+def bridge_list_keyboard(bridges, sessions_map, back_to="my_bridges_menu"):
+    buttons = []
+    for b in bridges:
+        status = EMOJI['active'] if b.is_active else EMOJI['inactive']
+        emoji = EMOJI['channel'] if b.source_type == 'channel' else EMOJI['chat']
+        session_info = sessions_map.get(b.session_id, "")
+        text = f"{status} {emoji} {b.source_title[:20]}"
+        if session_info:
+            text += f" ({session_info.label[:15]})"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"bridge_detail:{b.id}")])
+    buttons.append([InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data=back_to)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def bridge_detail_keyboard(bridge_id, is_active):
+    toggle_text = "🔴 Выключить" if is_active else "🟢 Включить"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle_bridge:{bridge_id}")],
+        [InlineKeyboardButton(text=f"{EMOJI['deleted']} Удалить", callback_data=f"delete_bridge:{bridge_id}")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="my_bridges_menu")],
+    ])
+
+
+def filter_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{EMOJI['all']} Все сообщения", callback_data="filter_all")],
+        [InlineKeyboardButton(text=f"{EMOJI['key']} По ключевым словам", callback_data="filter_keywords")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Отмена", callback_data="cancel_bridge")],
+    ])
+
+
+def bridge_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{EMOJI['channel']} Канал", callback_data="bridge_type:channel")],
+        [InlineKeyboardButton(text=f"{EMOJI['chat']} Чат/Группа", callback_data="bridge_type:chat")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Отмена", callback_data="main_menu")],
+    ])
+
+
+# ==================== QR AUTH ====================
+
+async def cleanup_qr_session(user_id: int) -> None:
+    entry = active_qr_sessions.pop(user_id, None)
+    if not entry:
+        return
+    task = entry.get("task")
+    if task and not task.done():
+        task.cancel()
+    client = entry.get("client")
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def wait_qr_approval(
+    user_id: int, api_id: int, api_hash: str, client: TelegramClient, qr_login
+) -> None:
+    try:
+        await qr_login.wait(timeout=180)
+        me = await client.get_me()
+        session_string = client.session.save()
+        phone = me.phone or "unknown"
+        
+        session_id = create_session(user_id, api_id, api_hash, session_string, phone, f"+{phone}")
+        
+        full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        await bot.send_message(
+            user_id,
+            f"{EMOJI['success']} <b>Аккаунт добавлен!</b>\n\n"
+            f"<b>ID:</b> <code>{session_id}</code>\n"
+            f"<b>Имя:</b> {full_name}\n"
+            f"<b>Телефон:</b> +{phone}\n\n"
+            f"Теперь можно создавать зеркала",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(),
+        )
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            user_id,
+            f"{EMOJI['error']} Время ожидания истекло (3 мин).\n\nПопробуйте: /start",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        await bot.send_message(
+            user_id,
+            f"{EMOJI['error']} Ошибка: {e}\n\n/start",
+            reply_markup=main_menu_keyboard(),
+        )
+    finally:
+        await cleanup_qr_session(user_id)
+
+
+# ==================== HANDLERS ====================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
+    migrate_old_user_data(user_id)
     
-    if not has_user_session(user_id):
+    sessions = get_user_sessions(user_id)
+    
+    if not sessions:
         await message.answer(
-            f"{EMOJI['welcome']} <b>Добро пожаловать в MIRROR Bot!</b> {EMOJI['mirror']}\n\n"
-            "Для начала работы нужно настроить Telegram API.\n"
-            "Это безопасно — данные хранятся только у вас.",
+            f"{EMOJI['welcome']} <b>MIRROR Bot</b>\n\n"
+            "Добро пожаловать! Добавьте Telegram аккаунт,\n"
+            "чтобы начать создавать зеркала каналов.",
             parse_mode=ParseMode.HTML,
-            reply_markup=get_setup_keyboard(),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{EMOJI['add']} Добавить аккаунт (QR)", callback_data="add_account")],
+            ]),
         )
         return
     
-    bridges = get_user_bridges(user_id)
     await message.answer(
-        f"{EMOJI['welcome']} <b>MIRROR Bot</b> {EMOJI['mirror']}\n\n"
-        "Создавай зеркала каналов и чатов!\n\n"
-        f"<b>📋 Команды:</b>\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"➕ /add — создать зеркало\n"
-        f"📜 /list — список зеркал\n"
-        f"🗑 /remove — удалить зеркало\n"
-        f"🔘 /toggle — вкл/выкл зеркало\n"
-        f"🔧 /setup — изменить API (SMS)\n"
-        f"⚡ /session — быстрая настройка",
+        f"{EMOJI['welcome']} <b>MIRROR Bot</b>\n\n"
+        f"{EMOJI['account']} Аккаунтов: {len(sessions)}\n\n"
+        f"Выберите действие:",
         parse_mode=ParseMode.HTML,
-        reply_markup=get_main_menu_keyboard(bool(bridges)),
+        reply_markup=main_menu_keyboard(),
     )
 
 
-@dp.callback_query(F.data == "setup_api")
-async def cb_setup_api(callback: types.CallbackQuery, state: FSMContext) -> None:
+@dp.callback_query(F.data == "main_menu")
+async def cb_main_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()  # Immediate response
+    await state.clear()
+    user_id = callback.from_user.id
+    sessions = get_user_sessions(user_id)
+    
+    text = f"{EMOJI['welcome']} <b>MIRROR Bot</b>\n\n"
+    if sessions:
+        text += f"{EMOJI['account']} Аккаунтов: {len(sessions)}\n\n"
+    text += "Выберите действие:"
+    
+    await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
+
+
+# -------------------- ACCOUNTS --------------------
+
+@dp.callback_query(F.data == "add_account")
+async def cb_add_account(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await cleanup_qr_session(callback.from_user.id)
+    await state.set_state(QrStates.waiting_for_api_id)
     await callback.message.edit_text(
-        "🔧 <b>Настройка Telegram API</b>\n\n"
-        "Шаг 1/3: Введите ваш <b>API_ID</b>\n\n"
-        "<i>Это число, например: 12345678</i>\n\n"
-        "<a href='https://my.telegram.org'>Получить API_ID и API_HASH</a>",
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+        f"{EMOJI['account']} <b>Добавление аккаунта</b>\n\n"
+        "Шаг 1/2: Введите API_ID\n"
+        "<i>Например: 12345678</i>",
+        reply_markup=back_keyboard(),
     )
-    await state.set_state(SetupStates.waiting_for_api_id)
 
 
-@dp.message(SetupStates.waiting_for_api_id)
+@dp.message(QrStates.waiting_for_api_id)
 async def process_api_id(message: types.Message, state: FSMContext) -> None:
     try:
         api_id = int(message.text.strip())
-        await state.update_data(api_id=api_id)
-        await message.answer(
-            "🔧 <b>Настройка API</b> — Шаг 2/3\n\n"
-            "Введите ваш <b>API_HASH</b>\n\n"
-            "<i>Это строка из букв и цифр</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(SetupStates.waiting_for_api_hash)
     except ValueError:
-        await message.answer(
-            f"{EMOJI['error']} API_ID должен быть числом!\n"
-            "Попробуйте снова:",
-            parse_mode=ParseMode.HTML,
-        )
+        await message.answer(f"{EMOJI['error']} API_ID должен быть числом")
+        return
+    await state.update_data(api_id=api_id)
+    await state.set_state(QrStates.waiting_for_api_hash)
+    await message.answer(
+        "Шаг 2/2: Введите API_HASH\n"
+        "<i>Строка из букв и цифр</i>",
+        reply_markup=back_keyboard(),
+    )
 
 
-@dp.message(SetupStates.waiting_for_api_hash)
+@dp.message(QrStates.waiting_for_api_hash)
 async def process_api_hash(message: types.Message, state: FSMContext) -> None:
     api_hash = message.text.strip()
     if len(api_hash) < 10:
-        await message.answer(
-            f"{EMOJI['error']} API_HASH слишком короткий!\n"
-            "Попробуйте снова:",
-            parse_mode=ParseMode.HTML,
-        )
+        await message.answer(f"{EMOJI['error']} Слишком короткий")
         return
-    
-    await state.update_data(api_hash=api_hash)
-    await message.answer(
-        "🔧 <b>Настройка API</b> — Шаг 3/3\n\n"
-        "Введите ваш <b>номер телефона</b>\n\n"
-        "<i>Формат: +79123456789</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.set_state(SetupStates.waiting_for_phone)
 
-
-@dp.message(SetupStates.waiting_for_phone)
-async def process_phone(message: types.Message, state: FSMContext) -> None:
-    phone = message.text.strip()
-    if not phone.startswith("+"):
-        await message.answer(
-            f"{EMOJI['error']} Номер должен начинаться с + !\n"
-            "Пример: +79123456789",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    
     data = await state.get_data()
-    api_id = data["api_id"]
-    api_hash = data["api_hash"]
-    
-    loading_msg = await message.answer(f"{EMOJI['loading']} Отправка кода...")
-    
-    # Start client and send code
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
-    
-    try:
-        sent_code = await client.send_code_request(phone)
-        # Save credentials only after successful code send
-        save_user_credentials(message.from_user.id, api_id, api_hash, phone)
-        await state.update_data(phone=phone, phone_code_hash=sent_code.phone_code_hash)
-        await loading_msg.edit_text(
-            f"{EMOJI['loading']} <b>Код отправлен!</b>\n\n"
-            f"Введите код подтверждения из SMS/Telegram:\n\n"
-            f"<i>Формат: 12345</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(SetupStates.waiting_for_code)
-        
-    except ApiIdInvalidError:
-        logger.error(f"Invalid API_ID for user {message.from_user.id}: {api_id}")
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Неверный API_ID или API_HASH!</b>\n\n"
-            f"Проверьте:\n"
-            f"• API_ID должен быть числом из https://my.telegram.org\n"
-            f"• API_HASH должен быть строкой из той же страницы\n"
-            f"• Не используйте API из примеров\n\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        
-    except PhoneNumberInvalidError:
-        logger.error(f"Invalid phone for user {message.from_user.id}: {phone}")
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Неверный номер телефона!</b>\n\n"
-            f"Формат: +79123456789\n"
-            f"Убедитесь, что номер зарегистрирован в Telegram.\n\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        
-    except PhoneNumberBannedError:
-        logger.error(f"Banned phone for user {message.from_user.id}: {phone}")
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Номер заблокирован!</b>\n\n"
-            f"Этот номер телефона забанен в Telegram.\n"
-            f"Используйте другой номер.\n\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        
-    except PhoneNumberFloodError as e:
-        logger.error(f"Phone flood for user {message.from_user.id}: {e}")
-        seconds = getattr(e, 'seconds', 3600)
-        minutes = seconds // 60
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Слишком много попыток!</b>\n\n"
-            f"На этот номер отправлено слишком много кодов.\n"
-            f"Подождите {minutes} минут и попробуйте снова.\n\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        
-    except FloodWaitError as e:
-        logger.error(f"Flood wait for user {message.from_user.id}: {e}")
-        seconds = getattr(e, 'seconds', 3600)
-        minutes = seconds // 60
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Лимит запросов!</b>\n\n"
-            f"Слишком много запросов к Telegram API.\n"
-            f"Подождите {minutes} минут и попробуйте снова.\n\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        
-    except RpcCallFailError as e:
-        logger.error(f"RPC error for user {message.from_user.id}: {e}")
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Ошибка Telegram API!</b>\n\n"
-            f"Возможные причины:\n"
-            f"• Неверный API_ID/API_HASH\n"
-            f"• IP адрес в бане\n"
-            f"• Временные проблемы Telegram\n\n"
-            f"Попробуйте позже или используйте другой API.\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        
-    except Exception as e:
-        logger.exception(f"Error sending code for user {message.from_user.id}")
-        error_msg = str(e)
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Ошибка отправки кода:</b>\n\n"
-            f"<code>{error_msg}</code>\n\n"
-            f"Начните заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-    finally:
-        await client.disconnect()
-
-
-@dp.message(SetupStates.waiting_for_code)
-async def process_code(message: types.Message, state: FSMContext) -> None:
-    # Clean code: remove spaces, dashes, and any non-digit characters
-    raw_code = message.text.strip()
-    code = ''.join(filter(str.isdigit, raw_code))
-    
-    logger.info(f"Processing code for user {message.from_user.id}: length={len(code)}")
-    
-    data = await state.get_data()
-    
     api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    phone = data.get("phone")
-    phone_code_hash = data.get("phone_code_hash")
+    user_id = message.from_user.id
     
-    if not all([api_id, api_hash, phone, phone_code_hash]):
-        await message.answer(
-            f"{EMOJI['error']} <b>Сессия устарела!</b>\n\n"
-            "Начните настройку заново: /setup",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
-        return
-    
+    loading = await message.answer(f"{EMOJI['loading']} Создаю QR...")
+
     client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
-    
     try:
-        await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
-        session_string = client.session.save()
+        await client.connect()
+        qr_login = await client.qr_login()
+        task = asyncio.create_task(
+            wait_qr_approval(user_id, api_id, api_hash, client, qr_login)
+        )
+        active_qr_sessions[user_id] = {"client": client, "task": task}
         
-        # Save session
-        save_session_string(message.from_user.id, session_string)
-        
-        await message.answer(
-            f"{EMOJI['success']} <b>API настроен успешно!</b>\n\n"
-            f"Теперь можно создавать зеркала.\n\n"
-            f"Давайте создадим первое зеркало?",
-            parse_mode=ParseMode.HTML,
+        qr_image_url = (
+            "https://api.qrserver.com/v1/create-qr-code/?size=520x520&data="
+            + quote_plus(qr_login.url)
+        )
+        await loading.delete()
+        await message.answer_photo(
+            photo=qr_image_url,
+            caption=(
+                "📱 <b>Сканируйте QR в Telegram</b>\n\n"
+                "<b>Настройки → Устройства → Подключить</b>\n\n"
+                f"Или ссылка: <code>{qr_login.url}</code>\n\n"
+                "Ожидание 3 минуты..."
+            ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"➕ {EMOJI['mirror']} Создать зеркало", callback_data="create_bridge")],
-                [InlineKeyboardButton(text="❌ Позже", callback_data="cancel")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
             ]),
         )
         await state.clear()
-        
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Sign in error for user {message.from_user.id}: {error_msg}")
-        
-        if "PHONE_CODE_INVALID" in error_msg:
-            await message.answer(
-                f"{EMOJI['error']} <b>Неверный код!</b>\n\n"
-                f"Вы ввели: <code>{raw_code}</code> (очищено: <code>{code}</code>)\n\n"
-                f"Проверьте:\n"
-                f"• Код из <b>SMS</b> или <b>Telegram</b> (не из 2FA!)\n"
-                f"• Введите только цифры без пробелов\n"
-                f"• Код действителен 2 минуты\n\n"
-                f"Попробуйте снова или начните заново /setup",
-                parse_mode=ParseMode.HTML,
-            )
-        elif "PHONE_CODE_EXPIRED" in error_msg:
-            await message.answer(
-                f"{EMOJI['error']} <b>Код истек!</b>\n\n"
-                f"Код действует 2 минуты. Начните заново: /setup",
-                parse_mode=ParseMode.HTML,
-            )
-            await state.clear()
-        else:
-            await message.answer(
-                f"{EMOJI['error']} <b>Ошибка:</b> {error_msg}\n\n"
-                f"Начните заново: /setup",
-                parse_mode=ParseMode.HTML,
-            )
-            await state.clear()
-    finally:
+        await loading.edit_text(f"{EMOJI['error']} Ошибка: {e}")
         await client.disconnect()
 
 
-@dp.callback_query(F.data == "create_bridge")
-@dp.message(Command("add"))
-async def start_create_bridge(message_or_callback, state: FSMContext) -> None:
-    if isinstance(message_or_callback, types.CallbackQuery):
-        message = message_or_callback.message
-        await message_or_callback.answer()
-    else:
-        message = message_or_callback
+@dp.callback_query(F.data == "my_accounts")
+async def cb_my_accounts(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    sessions = get_user_sessions(user_id)
     
-    user_id = message.chat.id if hasattr(message, 'chat') else message.from_user.id
-    
-    if not has_user_session(user_id):
-        await message.answer(
-            f"{EMOJI['error']} <b>Сначала настройте API!</b>\n\n"
-            "Используйте /setup или нажмите кнопку ниже:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_setup_keyboard(),
+    if not sessions:
+        await callback.message.edit_text(
+            f"{EMOJI['error']} Нет аккаунтов\n\n"
+            f"Добавьте первый:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{EMOJI['add']} Добавить", callback_data="add_account")],
+                [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="main_menu")],
+            ]),
         )
         return
     
-    await message.answer(
-        f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
-        "Шаг 1/3: Отправьте источник\n\n"
-        "<b>Это может быть:</b>\n"
-        "• Юзернейм канала: @channelname\n"
-        "• Ссылка: https://t.me/channel\n"
-        "• ID: -1001234567890",
+    text = f"{EMOJI['account']} <b>Ваши аккаунты:</b>\n\n"
+    for s in sessions:
+        text += f"• <code>{s.session_id}</code>: +{s.phone}\n"
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=session_list_keyboard(sessions),
+    )
+
+
+@dp.callback_query(F.data.startswith("session_detail:"))
+async def cb_session_detail(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+    session_id = int(callback.data.split(":")[1])
+    session = get_session(session_id)
+    
+    if not session:
+        await callback.answer("Аккаунт не найден!")
+        return
+    
+    bridges = get_user_bridges(callback.from_user.id)
+    session_bridges = [b for b in bridges if b.session_id == session_id]
+    
+    text = (
+        f"{EMOJI['account']} <b>Аккаунт {session_id}</b>\n\n"
+        f"Название: {session.label}\n"
+        f"Телефон: +{session.phone}\n"
+        f"Зеркал: {len(session_bridges)}\n\n"
+        f"Выберите действие:"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=session_detail_keyboard(session_id))
+
+
+@dp.callback_query(F.data.startswith("get_session_string:"))
+async def cb_get_session_string(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+    session_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    
+    session = get_session(session_id)
+    if not session or session.user_id != user_id:
+        await callback.answer("Аккаунт не найден!", show_alert=True)
+        return
+    
+    # Send session string as separate message
+    await callback.message.answer(
+        f"📋 <b>Session String для аккаунта {session.label}</b>\n\n"
+        f"<code>{session.session_string}</code>\n\n"
+        f"Скопируйте эту строку для вашего агента.",
         parse_mode=ParseMode.HTML,
     )
-    await state.set_state(BridgeStates.waiting_for_source)
 
 
-@dp.message(BridgeStates.waiting_for_source)
+@dp.callback_query(F.data.startswith("delete_session:"))
+async def cb_delete_session(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+    session_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    
+    # Check for active bridges
+    bridges = get_user_bridges(user_id)
+    active = [b for b in bridges if b.session_id == session_id and b.is_active]
+    
+    if active:
+        await callback.answer(f"Нельзя удалить! {len(active)} активных зеркал", show_alert=True)
+        return
+    
+    if delete_session(session_id, user_id):
+        await callback.answer("Аккаунт удален")
+        await cb_my_accounts(callback)
+    else:
+        await callback.answer("Не удалось удалить", show_alert=True)
+
+
+# -------------------- BRIDGES --------------------
+
+@dp.callback_query(F.data == "my_bridges_menu")
+async def cb_my_bridges_menu(callback: types.CallbackQuery) -> None:
+    """Show bridge type selection menu."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    bridges = get_user_bridges(user_id)
+    
+    if not bridges:
+        await callback.message.edit_text(
+            f"{EMOJI['mirror']} Нет зеркал\n\n"
+            f"Создайте первое:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{EMOJI['add']} Создать", callback_data="create_bridge")],
+                [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="main_menu")],
+            ]),
+        )
+        return
+    
+    channels_count = sum(1 for b in bridges if b.source_type == "channel")
+    chats_count = sum(1 for b in bridges if b.source_type == "chat")
+    
+    await callback.message.edit_text(
+        f"{EMOJI['mirror']} <b>Мои зеркала</b>\n\n"
+        f"📺 Каналы: {channels_count}\n"
+        f"💬 Чаты: {chats_count}\n"
+        f"📋 Всего: {len(bridges)}\n\n"
+        f"Выберите раздел:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"📺 Каналы ({channels_count})", callback_data="my_bridges:channel")],
+            [InlineKeyboardButton(text=f"💬 Чаты ({chats_count})", callback_data="my_bridges:chat")],
+            [InlineKeyboardButton(text=f"📋 Все зеркала", callback_data="my_bridges:all")],
+            [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="main_menu")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("my_bridges:"))
+async def cb_my_bridges(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    bridges = get_user_bridges(user_id)
+    sessions = {s.session_id: s for s in get_user_sessions(user_id)}
+    
+    filter_type = callback.data.split(":")[1]  # channel, chat, or all
+    
+    if filter_type == "channel":
+        bridges = [b for b in bridges if b.source_type == "channel"]
+        title = "📺 <b>Каналы:</b>"
+    elif filter_type == "chat":
+        bridges = [b for b in bridges if b.source_type == "chat"]
+        title = "💬 <b>Чаты:</b>"
+    else:
+        title = "📋 <b>Все зеркала:</b>"
+    
+    if not bridges:
+        await callback.message.edit_text(
+            f"{EMOJI['error']} Нет зеркал в этом разделе\n\n"
+            f"Создайте первое:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{EMOJI['add']} Создать", callback_data="create_bridge")],
+                [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="my_bridges_menu")],
+            ]),
+        )
+        return
+    
+    await callback.message.edit_text(
+        f"{EMOJI['mirror']} {title}\n\nНажмите для управления:",
+        reply_markup=bridge_list_keyboard(bridges, sessions, back_to="my_bridges_menu"),
+    )
+
+
+@dp.callback_query(F.data.startswith("bridge_detail:"))
+async def cb_bridge_detail(callback: types.CallbackQuery) -> None:
+    bridge_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    bridges = get_user_bridges(user_id)
+    bridge = next((b for b in bridges if b.id == bridge_id), None)
+    
+    if not bridge:
+        await callback.answer("Зеркало не найдено!")
+        return
+    
+    sessions = {s.session_id: s for s in get_user_sessions(user_id)}
+    session = sessions.get(bridge.session_id)
+    
+    status = "🟢 Активно" if bridge.is_active else "🔴 Выключено"
+    keywords_info = f"{EMOJI['key']} {bridge.keywords}" if bridge.keywords else f"{EMOJI['all']} Все сообщения"
+    
+    text = (
+        f"{EMOJI['mirror']} <b>Зеркало {bridge_id}</b>\n\n"
+        f"Статус: {status}\n"
+        f"Источник: {bridge.source_title}\n"
+        f"Цель: {bridge.target_title}\n"
+        f"Фильтр: {keywords_info}\n"
+    )
+    if session:
+        text += f"\nАккаунт: {session.label}"
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=bridge_detail_keyboard(bridge_id, bridge.is_active),
+    )
+
+
+@dp.callback_query(F.data.startswith("toggle_bridge:"))
+async def cb_toggle_bridge(callback: types.CallbackQuery) -> None:
+    bridge_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    
+    bridges = get_user_bridges(user_id)
+    bridge = next((b for b in bridges if b.id == bridge_id), None)
+    
+    if not bridge:
+        await callback.answer("Зеркало не найдено!")
+        return
+    
+    new_status = not bridge.is_active
+    toggle_bridge(bridge_id, new_status)
+    await callback.answer("Статус изменен!")
+    await cb_bridge_detail(callback)
+
+
+@dp.callback_query(F.data.startswith("delete_bridge:"))
+async def cb_delete_bridge(callback: types.CallbackQuery) -> None:
+    bridge_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    
+    if delete_bridge(bridge_id):
+        await callback.answer("Зеркало удалено")
+        await cb_my_bridges(callback)
+    else:
+        await callback.answer("Не удалось удалить", show_alert=True)
+
+
+# -------------------- CREATE BRIDGE --------------------
+
+@dp.callback_query(F.data == "create_bridge")
+async def cb_create_bridge(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    sessions = get_user_sessions(user_id)
+    
+    if not sessions:
+        await callback.answer("Сначала добавьте аккаунт!", show_alert=True)
+        return
+    
+    if len(sessions) == 1:
+        # Auto-select if only one session
+        await state.update_data(session_id=sessions[0].session_id)
+        await state.set_state(BridgeCreateStates.selecting_type)
+        await callback.message.edit_text(
+            f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+            f"Аккаунт: {sessions[0].label}\n\n"
+            f"Шаг 2/4: Выберите тип источника:",
+            reply_markup=bridge_type_keyboard(),
+        )
+        return
+    
+    # Multiple sessions - let user choose
+    await state.set_state(BridgeCreateStates.selecting_account)
+    await callback.message.edit_text(
+        f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+        f"Шаг 1/4: Выберите аккаунт:",
+        reply_markup=session_list_keyboard(sessions, with_create_bridge=True),
+    )
+
+
+@dp.callback_query(F.data.startswith("select_session_for_bridge:"))
+async def cb_select_session_for_bridge(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    session_id = int(callback.data.split(":")[1])
+    await state.update_data(session_id=session_id)
+    session = get_session(session_id)
+
+    await state.set_state(BridgeCreateStates.selecting_type)
+    await callback.message.edit_text(
+        f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+        f"Аккаунт: {session.label}\n\n"
+        f"Шаг 2/4: Выберите тип источника:",
+        reply_markup=bridge_type_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("create_bridge_with_session:"))
+async def cb_create_bridge_with_session(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    session_id = int(callback.data.split(":")[1])
+    await state.update_data(session_id=session_id)
+    session = get_session(session_id)
+
+    await state.set_state(BridgeCreateStates.selecting_type)
+    await callback.message.edit_text(
+        f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+        f"Аккаунт: {session.label}\n\n"
+        f"Шаг 2/4: Выберите тип источника:",
+        reply_markup=bridge_type_keyboard(),
+    )
+
+
+@dp.message(BridgeCreateStates.entering_source)
 async def process_bridge_source(message: types.Message, state: FSMContext) -> None:
     source_input = message.text.strip()
-    await state.update_data(source_input=source_input)
     
+    # Parse link
+    if source_input.startswith("https://t.me/"):
+        from urllib.parse import urlparse
+        path = urlparse(source_input).path.strip("/").split("/")
+        if len(path) >= 2 and path[0] == "c":
+            try:
+                chat_id = int(path[1])
+                source_input = f"-100{chat_id}"
+            except (ValueError, IndexError):
+                pass
+        elif len(path) >= 1:
+            source_input = f"@{path[0]}"
+    
+    await state.update_data(source_input=source_input)
+    await state.set_state(BridgeCreateStates.selecting_filter)
+
     await message.answer(
-        f"{EMOJI['mirror']} <b>Создание зеркала</b> — Шаг 2/3\n\n"
-        "<b>Выберите вариант:</b>\n\n"
-        f"{EMOJI['all']} <b>Без ключевых слов</b> — будут пересылаться ВСЕ сообщения\n\n"
-        f"{EMOJI['key']} <b>С ключевыми словами</b> — только сообщения с определёнными словами",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_keywords_choice_keyboard(),
+        f"{EMOJI['mirror']} <b>Создание зеркала</b> — Шаг 4/4\n\n"
+        f"Выберите тип фильтра:",
+        reply_markup=filter_type_keyboard(),
     )
-    await state.set_state(BridgeStates.waiting_for_keywords_choice)
 
 
-@dp.callback_query(F.data == "keywords_none")
-async def cb_no_keywords(callback: types.CallbackQuery, state: FSMContext) -> None:
+@dp.callback_query(F.data == "filter_all")
+async def cb_filter_all(callback: types.CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.update_data(keywords="")
     await create_bridge(callback.message, state)
 
 
-@dp.callback_query(F.data == "keywords_yes")
-async def cb_yes_keywords(callback: types.CallbackQuery, state: FSMContext) -> None:
+@dp.callback_query(F.data == "filter_keywords")
+async def cb_filter_keywords(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(BridgeCreateStates.entering_keywords)
     await callback.message.edit_text(
-        f"{EMOJI['mirror']} <b>Создание зеркала</b> — Шаг 3/3\n\n"
-        f"{EMOJI['key']} Введите <b>ключевые слова</b> через запятую:\n\n"
-        "<i>Пример: биткоин,btc,новости</i>\n\n"
-        "Будут пересылаться только сообщения, содержащие эти слова.",
-        parse_mode=ParseMode.HTML,
+        f"{EMOJI['key']} Введите ключевые слова через запятую:\n\n"
+        f"<i>Например: btc,eth,новости</i>",
+        reply_markup=back_keyboard("cancel_bridge"),
     )
-    await state.set_state(BridgeStates.waiting_for_keywords)
 
 
-@dp.message(BridgeStates.waiting_for_keywords)
+@dp.message(BridgeCreateStates.entering_keywords)
 async def process_keywords(message: types.Message, state: FSMContext) -> None:
     keywords = message.text.strip()
     await state.update_data(keywords=keywords)
@@ -488,61 +701,64 @@ async def process_keywords(message: types.Message, state: FSMContext) -> None:
 
 async def create_bridge(message: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
-    source_input = data["source_input"]
+    source_input = data.get("source_input")
     keywords = data.get("keywords", "")
-    user_id = message.from_user.id
+    session_id = data.get("session_id")
+    selected_source_type = data.get("source_type", "channel")  # User-selected type
+    user_id = message.chat.id if hasattr(message, 'chat') else message.from_user.id
     
-    loading_msg = await message.answer(f"{EMOJI['loading']} Поиск источника...")
+    if not all([source_input, session_id]):
+        await message.answer(f"{EMOJI['error']} Ошибка данных")
+        await state.clear()
+        return
+    
+    session = get_session(session_id)
+    if not session:
+        await message.answer(f"{EMOJI['error']} Аккаунт не найден")
+        await state.clear()
+        return
+    
+    loading = await message.answer(f"{EMOJI['loading']} Создание...")
+    
+    client = TelegramClient(
+        StringSession(session.session_string),
+        session.api_id,
+        session.api_hash,
+    )
     
     try:
-        client = await get_user_client(user_id)
-        if not client:
-            await loading_msg.edit_text(
-                f"{EMOJI['error']} Ошибка: клиент не настроен!",
-                parse_mode=ParseMode.HTML,
-            )
-            await state.clear()
-            return
-        
         await client.connect()
         manager = ChannelManager(client)
         
         resolved = await manager.resolve_source(source_input)
         if not resolved:
-            await loading_msg.edit_text(
-                f"{EMOJI['error']} <b>Источник не найден!</b>\n\n"
-                "Проверьте:\n"
-                "• Правильность ссылки/ID\n"
-                "• Доступ бота к источнику",
-                parse_mode=ParseMode.HTML,
+            await loading.edit_text(
+                f"{EMOJI['error']} Источник не найден. Проверьте доступ.",
+                reply_markup=main_menu_keyboard(),
             )
             await state.clear()
             return
         
-        source_id, source_type, source_title = resolved
-        
-        await loading_msg.edit_text(f"{EMOJI['loading']} Создание {EMOJI['mirror']} зеркала...")
+        source_id, resolved_type, source_title = resolved
+        # Use user-selected type, but log if there's a mismatch
+        source_type = selected_source_type
+        if resolved_type != selected_source_type:
+            logger.warning(f"Type mismatch: selected={selected_source_type}, resolved={resolved_type}")
         
         result = await manager.create_target_for_source(source_title, source_type)
-        
         if not result:
-            await loading_msg.edit_text(
-                f"{EMOJI['error']} <b>Не удалось создать зеркало!</b>\n\n"
-                f"Возможные причины:\n"
-                f"• Нет прав на создание каналов\n"
-                f"• Flood limits (подождите 1-2 минуты)\n"
-                f"• Ошибка API\n\n"
-                f"Попробуйте снова позже.",
-                parse_mode=ParseMode.HTML,
+            await loading.edit_text(
+                f"{EMOJI['error']} Не удалось создать канал",
+                reply_markup=main_menu_keyboard(),
             )
-            await client.disconnect()
             await state.clear()
             return
         
         internal_id, target_id, target_title = result
-
+        
         bridge_id = add_bridge(
             user_id=user_id,
+            session_id=session_id,
             source_id=source_id,
             source_type=source_type,
             source_title=source_title,
@@ -552,361 +768,147 @@ async def create_bridge(message: types.Message, state: FSMContext) -> None:
             keywords=keywords,
         )
         
-        await loading_msg.delete()
+        await loading.delete()
         
-        keywords_text = f"\n{EMOJI['key']} <b>Ключевые слова:</b> <code>{keywords}</code>" if keywords else f"\n{EMOJI['all']} <b>Пересылка:</b> все сообщения"
+        keywords_text = f"\n{EMOJI['key']} Фильтр: {keywords}" if keywords else f"\n{EMOJI['all']} Все сообщения"
         
         await message.answer(
-            f"{EMOJI['success']} <b>Зеркало создано!</b> {EMOJI['success']}\n\n"
-            f"{EMOJI['mirror']} <b>Источник:</b> <code>{source_title}</code>\n"
-            f"{EMOJI['channel'] if source_type == 'channel' else EMOJI['chat']} <b>Тип:</b> {source_type.upper()}\n"
-            f"🎯 <b>Зеркало:</b> <code>{target_title}</code>\n"
-            f"🆔 <b>ID бриджа:</b> <code>{bridge_id}</code>"
-            f"{keywords_text}\n\n"
-            f"<i>✨ Зеркало активно!</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_main_menu_keyboard(has_bridges=True),
+            f"{EMOJI['success']} <b>Зеркало создано!</b>\n\n"
+            f"ID: <code>{bridge_id}</code>\n"
+            f"Аккаунт: {session.label}\n"
+            f"Источник: {source_title}\n"
+            f"Цель: {target_title}"
+            f"{keywords_text}",
+            reply_markup=main_menu_keyboard(),
         )
         
     except Exception as e:
-        logger.exception("Error creating bridge")
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Ошибка:</b> <code>{e}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        logger.exception("Create bridge error")
+        await loading.edit_text(f"{EMOJI['error']} Ошибка: {e}", reply_markup=main_menu_keyboard())
     finally:
         await client.disconnect()
         await state.clear()
 
 
-@dp.callback_query(F.data == "cancel")
-async def cb_cancel(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
+@dp.callback_query(F.data.startswith("bridge_type:"))
+async def cb_select_bridge_type(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    bridge_type = callback.data.split(":")[1]  # channel or chat
+    await state.update_data(source_type=bridge_type)
+
+    hints = (
+        f"• @channelname (публичный канал)\n"
+        f"• https://t.me/c/1234567890/1 (ссылка на сообщение)\n"
+        f"• -1001234567890 (ID канала)"
+        if bridge_type == "channel"
+        else
+        f"• Перешлите сообщение из чата\n"
+        f"• https://t.me/c/1234567890/1 (ссылка из Web/Desktop)\n"
+        f"• -1001234567890 (ID чата)"
+    )
+
+    await state.set_state(BridgeCreateStates.entering_source)
     await callback.message.edit_text(
-        f"{EMOJI['mirror']} <b>Отменено</b>\n\n"
-        "Используйте /start для возврата в меню."
+        f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+        f"Тип: {'Канал' if bridge_type == 'channel' else 'Чат'}\n\n"
+        f"Шаг 3/4: Отправьте источник\n\n"
+        f"{hints}",
+        reply_markup=back_keyboard("main_menu"),
     )
 
 
-@dp.callback_query(F.data == "list_bridges")
-@dp.message(Command("list"))
-async def cmd_list(message_or_callback, state: FSMContext) -> None:
+@dp.callback_query(F.data == "cancel_bridge")
+async def cb_cancel_bridge(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
     await state.clear()
-    
-    if isinstance(message_or_callback, types.CallbackQuery):
-        message = message_or_callback.message
-        await message_or_callback.answer()
-    else:
-        message = message_or_callback
-    
-    user_id = message.chat.id if hasattr(message, 'chat') else message.from_user.id
-    bridges = get_user_bridges(user_id)
-
-    if not bridges:
-        await message.answer(
-            f"{EMOJI['mirror']} <b>У вас пока нет зеркал!</b>\n\n"
-            "Создайте первое зеркало:\n"
-            "/add",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    lines = [f"{EMOJI['mirror']} <b>Ваши зеркала:</b>\n"]
-    
-    for b in bridges:
-        status = f"{EMOJI['active']} ВКЛ" if b.is_active else f"{EMOJI['inactive']} ВЫКЛ"
-        emoji = EMOJI['channel'] if b.source_type == "channel" else EMOJI['chat']
-        keywords_info = f"{EMOJI['key']} <code>{b.keywords}</code>" if b.keywords else f"{EMOJI['all']} все"
-        lines.append(
-            f"\n{emoji} <b>ID:</b> <code>{b.id}</code> — {status}\n"
-            f"   <b>От:</b> {b.source_title}\n"
-            f"   <b>К:</b> {b.target_title}\n"
-            f"   <b>Фильтр:</b> {keywords_info}"
-        )
-
-    text = "\n".join(lines)
-    text += f"\n\n<i>✨ Используйте /toggle ID или /remove ID</i>"
-
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("Отменено", reply_markup=main_menu_keyboard())
 
 
-@dp.message(Command("remove"))
-async def cmd_remove(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
-    args = message.text.split()
-    
-    if len(args) < 2:
-        await message.answer(
-            f"{EMOJI['error']} <b>Использование:</b> <code>/remove ID</code>\n\n"
-            "Узнать ID: /list",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    try:
-        bridge_id = int(args[1])
-    except ValueError:
-        await message.answer(
-            f"{EMOJI['error']} ID должен быть числом!",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    user_id = message.from_user.id
-    bridges = get_user_bridges(user_id)
-    bridge = next((b for b in bridges if b.id == bridge_id), None)
-
-    if not bridge:
-        await message.answer(
-            f"{EMOJI['error']} Зеркало <code>{bridge_id}</code> не найдено!",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if delete_bridge(bridge_id):
-        await message.answer(
-            f"{EMOJI['deleted']} <b>Зеркало {bridge_id} удалено!</b>\n\n"
-            f"{EMOJI['mirror']} <b>Было:</b> {bridge.source_title} → {bridge.target_title}",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await message.answer(
-            f"{EMOJI['error']} Не удалось удалить зеркало {bridge_id}",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-@dp.message(Command("toggle"))
-async def cmd_toggle(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
-    args = message.text.split()
-    
-    if len(args) < 2:
-        await message.answer(
-            f"{EMOJI['error']} <b>Использование:</b> <code>/toggle ID</code>\n\n"
-            "Узнать ID: /list",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    try:
-        bridge_id = int(args[1])
-    except ValueError:
-        await message.answer(
-            f"{EMOJI['error']} ID должен быть числом!",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    user_id = message.from_user.id
-    bridges = get_user_bridges(user_id)
-    bridge = next((b for b in bridges if b.id == bridge_id), None)
-
-    if not bridge:
-        await message.answer(
-            f"{EMOJI['error']} Зеркало <code>{bridge_id}</code> не найдено!",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    new_status = not bridge.is_active
-    toggle_bridge(bridge_id, new_status)
-
-    status_emoji = EMOJI['active'] if new_status else EMOJI['inactive']
-    status_text = "ВКЛЮЧЕНО" if new_status else "ВЫКЛЮЧЕНО"
-    
-    await message.answer(
-        f"{status_emoji} <b>Зеркало {bridge_id} {status_text}</b>\n\n"
-        f"{EMOJI['mirror']} <b>Источник:</b> {bridge.source_title}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@dp.message(Command("setup"))
-async def cmd_setup(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(
-        "🔧 <b>Настройка API</b>\n\n"
-        "Внимание: текущие настройки будут заменены!\n\n"
-        "Продолжить?",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, настроить", callback_data="setup_api")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
-        ]),
-    )
-
+# -------------------- HELP & UNKNOWN --------------------
 
 @dp.callback_query(F.data == "help")
 async def cb_help(callback: types.CallbackQuery) -> None:
+    await callback.answer()
     await callback.message.edit_text(
-        f"{EMOJI['mirror']} <b>Помощь MIRROR Bot</b>\n\n"
-        "<b>Что такое зеркало?</b>\n"
-        "Копия канала или чата, куда автоматически попадают все сообщения.\n\n"
-        "<b>Как это работает:</b>\n"
-        "1️⃣ Вы добавляете источник с помощью /add\n"
-        "2️⃣ Бот создаёт новый канал/чат 'MIRROR: Название'\n"
-        "3️⃣ Все сообщения из источника появляются в зеркале\n\n"
-        "<b>Варианты при создании:</b>\n"
-        f"{EMOJI['all']} Без ключевых слов — все сообщения\n"
-        f"{EMOJI['key']} С ключевыми словами — только с определёнными словами\n\n"
-        "<b>Ключевые слова:</b>\n"
-        "Фильтр сообщений. Например: btc,eth — только сообщения с этими словами.",
-        parse_mode=ParseMode.HTML,
+        f"{EMOJI['mirror']} <b>Помощь</b>\n\n"
+        f"<b>Каналы:</b>\n"
+        f"• Ссылка на сообщение (Web/Desktop)\n"
+        f"• @username (если публичный)\n\n"
+        f"<b>Чаты/Группы:</b>\n"
+        f"• Добавьте бота в группу → он покажет ID\n"
+        f"• Или перешлите сообщение из группы\n\n"
+        f"<b>Telegram Web:</b>\n"
+        f"В адресной строке виден ID чата",
+        reply_markup=main_menu_keyboard(),
     )
 
 
-# Session string direct input
-class SessionStates(StatesGroup):
-    waiting_for_api_id_session = State()
-    waiting_for_api_hash_session = State()
-    waiting_for_session_string = State()
-
-
-@dp.message(Command("session"))
-async def cmd_session(message: types.Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(
-        f"{EMOJI['mirror']} <b>Быстрая настройка через SESSION_STRING</b>\n\n"
-        "Этот способ быстрее — не нужно ждать SMS код.\n\n"
-        "<b>Как получить SESSION_STRING:</b>\n"
-        "1️⃣ Откройте Python на любом устройстве\n"
-        "2️⃣ Выполните:\n"
-        "<code>python -c \"from telethon.sync import TelegramClient; from telethon.sessions import StringSession; print(StringSession().save())\"</code>\n\n"
-        "3️⃣ Введите API_ID, API_HASH, телефон\n"
-        "4️⃣ Код придет в Telegram (не SMS!) — введите его\n"
-        "5️⃣ Скопируйте длинную строку — это SESSION_STRING\n\n"
-        "Готовы продолжить?",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, ввести данные", callback_data="session_start")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
-        ]),
-    )
-
-
-@dp.callback_query(F.data == "session_start")
-async def cb_session_start(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text(
-        "🔧 <b>Ввод SESSION_STRING</b> — Шаг 1/3\n\n"
-        "Введите ваш <b>API_ID</b>\n\n"
-        "<i>Число, например: 12345678</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.set_state(SessionStates.waiting_for_api_id_session)
-
-
-@dp.message(SessionStates.waiting_for_api_id_session)
-async def process_session_api_id(message: types.Message, state: FSMContext) -> None:
-    try:
-        api_id = int(message.text.strip())
-        await state.update_data(api_id=api_id)
-        await message.answer(
-            "🔧 <b>Ввод SESSION_STRING</b> — Шаг 2/3\n\n"
-            "Введите ваш <b>API_HASH</b>\n\n"
-            "<i>Строка из букв и цифр</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(SessionStates.waiting_for_api_hash_session)
-    except ValueError:
-        await message.answer(
-            f"{EMOJI['error']} API_ID должен быть числом!\n"
-            "Попробуйте снова:",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-@dp.message(SessionStates.waiting_for_api_hash_session)
-async def process_session_api_hash(message: types.Message, state: FSMContext) -> None:
-    api_hash = message.text.strip()
-    if len(api_hash) < 10:
-        await message.answer(
-            f"{EMOJI['error']} API_HASH слишком короткий!\n"
-            "Попробуйте снова:",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    
-    await state.update_data(api_hash=api_hash)
-    await message.answer(
-        "🔧 <b>Ввод SESSION_STRING</b> — Шаг 3/3\n\n"
-        "Вставьте ваш <b>SESSION_STRING</b>\n\n"
-        "<i>Это длинная строка из букв и цифр, которую вы получили через Python</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.set_state(SessionStates.waiting_for_session_string)
-
-
-@dp.message(SessionStates.waiting_for_session_string)
-async def process_session_string(message: types.Message, state: FSMContext) -> None:
-    session_string = message.text.strip()
-    
-    if len(session_string) < 50:
-        await message.answer(
-            f"{EMOJI['error']} SESSION_STRING слишком короткая!\n\n"
-            "Обычно она длинная (200+ символов).\n"
-            "Проверьте, что скопировали всё.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    
-    data = await state.get_data()
-    api_id = data["api_id"]
-    api_hash = data["api_hash"]
-    user_id = message.from_user.id
-    
-    # Test the session
-    loading_msg = await message.answer(f"{EMOJI['loading']} Проверка сессии...")
-    
-    try:
-        client = TelegramClient(StringSession(session_string), api_id, api_hash)
-        await client.connect()
+# Handle bot added to group
+@dp.my_chat_member()
+async def on_chat_member_update(update: types.ChatMemberUpdated) -> None:
+    """When bot is added to group/channel, show the ID."""
+    if update.new_chat_member.status in ["member", "administrator"]:
+        chat_id = update.chat.id
+        chat_title = update.chat.title or "Unknown"
+        chat_type = update.chat.type
         
-        if not await client.is_user_authorized():
-            await loading_msg.edit_text(
-                f"{EMOJI['error']} <b>Сессия недействительна!</b>\n\n"
-                "Создайте новую сессию через Python.\n"
-                "Убедитесь, что ввели правильный API_ID и API_HASH.",
+        try:
+            await bot.send_message(
+                update.from_user.id,
+                f"🆔 <b>Бот добавлен в чат!</b>\n\n"
+                f"Название: {chat_title}\n"
+                f"Тип: {chat_type}\n"
+                f"ID: <code>{chat_id}</code>\n\n"
+                f"Для создания зеркала используйте:\n"
+                f"<code>/add {chat_id}</code>",
                 parse_mode=ParseMode.HTML,
             )
-            await client.disconnect()
-            await state.clear()
-            return
-        
-        me = await client.get_me()
-        phone = me.phone or "unknown"
-        
-        # Save credentials
-        save_user_credentials(user_id, api_id, api_hash, phone)
-        save_session_string(user_id, session_string)
-        
-        await client.disconnect()
-        
-        await loading_msg.edit_text(
-            f"{EMOJI['success']} <b>API настроен успешно!</b>\n\n"
-            f"Аккаунт: {me.first_name} {me.lastname or ''}\n"
-            f"Телефон: +{phone}\n\n"
-            f"Теперь можно создавать зеркала!",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"➕ {EMOJI['mirror']} Создать зеркало", callback_data="create_bridge")],
-                [InlineKeyboardButton(text="📜 Список команд", callback_data="help")],
-            ]),
-        )
-        await state.clear()
-        
-    except Exception as e:
-        logger.exception("Session validation error")
-        await loading_msg.edit_text(
-            f"{EMOJI['error']} <b>Ошибка проверки сессии:</b>\n\n"
-            f"<code>{e}</code>\n\n"
-            f"Проверьте:\n"
-            f"• Правильность API_ID и API_HASH\n"
-            f"• SESSION_STRING скопирован полностью\n"
-            f"• Сессия не устарела",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.clear()
+        except Exception:
+            pass  # User may have blocked bot
+
+
+@dp.message(F.forward_from_chat)
+async def handle_forwarded_message(message: types.Message) -> None:
+    """Extract chat ID from forwarded messages."""
+    chat = message.forward_from_chat
+    chat_id = chat.id
+    chat_title = chat.title or "Unknown"
+    chat_type = chat.type
+    
+    type_names = {
+        "channel": "Канал",
+        "supergroup": "Супергруппа",
+        "group": "Группа",
+    }
+    type_name = type_names.get(chat_type, chat_type)
+    
+    await message.answer(
+        f"🆔 <b>Информация об источнике:</b>\n\n"
+        f"Название: {chat_title}\n"
+        f"Тип: {type_name}\n"
+        f"ID: <code>{chat_id}</code>\n\n"
+        f"Для создания зеркала:\n"
+        f"1. Нажмите ➕ <b>Создать зеркало</b>\n"
+        f"2. Выберите тип: {'Канал' if chat_type == 'channel' else 'Чат'}\n"
+        f"3. Введите: <code>{chat_id}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+@dp.message(F.text.startswith("/"))
+async def handle_unknown(message: types.Message) -> None:
+    cmd = message.text.split()[0].lower()
+    
+    known = ["/start", "/help"]
+    if cmd in known:
+        return
+    
+    await message.answer(
+        f"{EMOJI['error']} Неизвестная команда\n\n"
+        f"Используйте кнопки или /start",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def main() -> None:
