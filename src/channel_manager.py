@@ -12,13 +12,13 @@ class ChannelManager:
         self.client = client
 
     async def create_target_for_source(
-        self, source_title: str, source_type: str
+        self, source_title: str, target_type: str
     ) -> tuple[int, int, str] | None:
         """Create target channel/chat/forum. Returns (internal_id, target_id, title) or None."""
         try:
-            if source_type == "channel":
+            if target_type == "channel":
                 return await self._create_channel(source_title)
-            elif source_type == "forum":
+            elif target_type == "forum":
                 return await self._create_forum(source_title)
             else:
                 return await self._create_megagroup(source_title)

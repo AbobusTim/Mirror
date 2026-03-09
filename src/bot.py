@@ -100,6 +100,10 @@ class QrStates(StatesGroup):
 class BridgeCreateStates(StatesGroup):
     selecting_account = State()
     selecting_type = State()
+    selecting_target_type = State()
+    selecting_forum_mode = State()
+    entering_custom_forum_title = State()
+    entering_custom_topic_title = State()
     entering_source = State()
     selecting_topics = State()
     selecting_filter = State()
@@ -170,11 +174,12 @@ def bridge_list_keyboard(bridges, sessions_map, back_to="my_bridges_menu"):
     buttons = []
     for b in bridges:
         status = EMOJI['active'] if b.is_active else EMOJI['inactive']
+        display_type = bridge_display_type(b)
         emoji = {
             "channel": EMOJI["channel"],
             "chat": EMOJI["chat"],
             "forum": EMOJI["forum"],
-        }.get(b.source_type, EMOJI["mirror"])
+        }.get(display_type, EMOJI["mirror"])
         session_info = sessions_map.get(b.session_id, "")
         text = f"{status} {emoji} {b.source_title[:20]}"
         if session_info:
@@ -211,6 +216,32 @@ def bridge_type_keyboard():
         [InlineKeyboardButton(text=f"{EMOJI['forum']} Форум", callback_data="bridge_type:forum")],
         [InlineKeyboardButton(text=f"{EMOJI['back']} Отменить", callback_data="main_menu")],
     ])
+
+
+def target_type_keyboard(source_type: str) -> InlineKeyboardMarkup:
+    source_label = {"channel": "Канал", "chat": "Чат", "forum": "Форум"}.get(source_type, "Источник")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"↪️ Как источник ({source_label})",
+                    callback_data=f"target_type:{source_type}",
+                )
+            ],
+            [InlineKeyboardButton(text=f"{EMOJI['forum']} Создать как форум", callback_data="target_type:forum")],
+            [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="create_bridge")],
+        ]
+    )
+
+
+def forum_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧵 Миррорить форум", callback_data="forum_mode:mirror")],
+            [InlineKeyboardButton(text="🛠 Создать свой форум", callback_data="forum_mode:custom")],
+            [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="create_bridge")],
+        ]
+    )
 
 
 def topic_selection_keyboard(
@@ -346,6 +377,10 @@ def ensure_general_topic_selected(topics: list[tuple[int, str]], selected_ids: s
     if any(topic_id == GENERAL_TOPIC_ID for topic_id, _ in topics):
         selected_ids.add(GENERAL_TOPIC_ID)
     return selected_ids
+
+
+def bridge_display_type(bridge) -> str:
+    return bridge.target_type or bridge.source_type
 
 
 async def ensure_bridge_topic_rule(
@@ -706,9 +741,9 @@ async def cb_my_bridges_menu(callback: types.CallbackQuery) -> None:
         )
         return
     
-    channels_count = sum(1 for b in bridges if b.source_type == "channel")
-    chats_count = sum(1 for b in bridges if b.source_type == "chat")
-    forums_count = sum(1 for b in bridges if b.source_type == "forum")
+    channels_count = sum(1 for b in bridges if bridge_display_type(b) == "channel")
+    chats_count = sum(1 for b in bridges if bridge_display_type(b) == "chat")
+    forums_count = sum(1 for b in bridges if bridge_display_type(b) == "forum")
     
     await callback.message.edit_text(
         f"{EMOJI['mirror']} <b>Мои зеркала</b>\n\n"
@@ -737,13 +772,13 @@ async def cb_my_bridges(callback: types.CallbackQuery) -> None:
     filter_type = callback.data.split(":")[1]  # channel, chat, or all
     
     if filter_type == "channel":
-        bridges = [b for b in bridges if b.source_type == "channel"]
+        bridges = [b for b in bridges if bridge_display_type(b) == "channel"]
         title = "📺 <b>Каналы:</b>"
     elif filter_type == "chat":
-        bridges = [b for b in bridges if b.source_type == "chat"]
+        bridges = [b for b in bridges if bridge_display_type(b) == "chat"]
         title = "💬 <b>Чаты:</b>"
     elif filter_type == "forum":
-        bridges = [b for b in bridges if b.source_type == "forum"]
+        bridges = [b for b in bridges if bridge_display_type(b) == "forum"]
         title = "🧵 <b>Форумы:</b>"
     else:
         title = "📋 <b>Все зеркала:</b>"
@@ -782,24 +817,25 @@ async def cb_bridge_detail(callback: types.CallbackQuery, state: FSMContext) -> 
     
     status = "🟢 Активно" if bridge.is_active else "🔴 Выключено"
     keywords_info = f"{EMOJI['key']} {bridge.keywords}" if bridge.keywords else f"{EMOJI['all']} без ограничений"
-    rule_count = len(get_topic_rules_for_bridge(bridge.id, active_only=False)) if bridge.source_type == "forum" else 0
+    display_type = bridge_display_type(bridge)
+    rule_count = len(get_topic_rules_for_bridge(bridge.id, active_only=False)) if display_type == "forum" else 0
     
     text = (
         f"{EMOJI['mirror']} <b>Зеркало {bridge_id}</b>\n\n"
         f"Статус: {status}\n"
-        f"Тип: {bridge.source_type}\n"
+        f"Тип: {display_type}\n"
         f"Источник: {bridge.source_title}\n"
         f"Цель: {bridge.target_title}\n"
         f"Фильтр: {keywords_info}\n"
     )
-    if bridge.source_type == "forum":
+    if display_type == "forum":
         text += f"Веток подключено: {rule_count}\n"
     if session:
         text += f"\nАккаунт: {safe_html(session.label)}"
     
     await callback.message.edit_text(
         text,
-        reply_markup=bridge_detail_keyboard(bridge_id, bridge.is_active, is_forum=bridge.source_type == "forum"),
+        reply_markup=bridge_detail_keyboard(bridge_id, bridge.is_active, is_forum=display_type == "forum"),
     )
 
 
@@ -839,7 +875,7 @@ async def cb_topic_editor(callback: types.CallbackQuery, state: FSMContext) -> N
     await state.clear()
     bridge_id = int(callback.data.split(":")[1])
     bridge = next((b for b in get_user_bridges(callback.from_user.id) if b.id == bridge_id), None)
-    if not bridge or bridge.source_type != "forum":
+    if not bridge or bridge.target_type != "forum":
         await callback.answer("Форум не найден", show_alert=True)
         return
 
@@ -908,7 +944,7 @@ async def cb_delete_topic_rule(callback: types.CallbackQuery, state: FSMContext)
     bridge = next((b for b in get_user_bridges(callback.from_user.id) if b.id == bridge_id), None)
     rules = get_topic_rules_for_bridge(bridge_id)
     await state.clear()
-    if not bridge or bridge.source_type != "forum":
+    if not bridge or bridge.target_type != "forum":
         await callback.answer("Форум не найден", show_alert=True)
         return
     await callback.message.edit_text(
@@ -1014,6 +1050,9 @@ async def cb_topic_add_source(callback: types.CallbackQuery, state: FSMContext) 
     bridge = next((b for b in get_user_bridges(callback.from_user.id) if b.id == bridge_id), None)
     if not bridge:
         await callback.answer("Зеркало не найдено", show_alert=True)
+        return
+    if bridge.source_type != "forum":
+        await callback.answer("Источник этого зеркала не форум", show_alert=True)
         return
 
     session = get_session(bridge.session_id)
@@ -1318,7 +1357,7 @@ async def cb_create_bridge(callback: types.CallbackQuery, state: FSMContext) -> 
         await callback.message.edit_text(
             f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
             f"Аккаунт: <b>{safe_html(sessions[0].label)}</b>\n\n"
-            f"Шаг 2 из 4. Выберите тип источника:",
+            f"Шаг 2 из 5. Выберите тип источника:",
             reply_markup=bridge_type_keyboard(),
         )
         return
@@ -1327,7 +1366,7 @@ async def cb_create_bridge(callback: types.CallbackQuery, state: FSMContext) -> 
     await state.set_state(BridgeCreateStates.selecting_account)
     await callback.message.edit_text(
         f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
-        f"Шаг 1 из 4. Выберите аккаунт:",
+        f"Шаг 1 из 5. Выберите аккаунт:",
         reply_markup=session_list_keyboard(sessions, with_create_bridge=True),
     )
 
@@ -1343,7 +1382,7 @@ async def cb_select_session_for_bridge(callback: types.CallbackQuery, state: FSM
     await callback.message.edit_text(
         f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
         f"Аккаунт: <b>{safe_html(session.label)}</b>\n\n"
-        f"Шаг 2 из 4. Выберите тип источника:",
+        f"Шаг 2 из 5. Выберите тип источника:",
         reply_markup=bridge_type_keyboard(),
     )
 
@@ -1359,7 +1398,7 @@ async def cb_create_bridge_with_session(callback: types.CallbackQuery, state: FS
     await callback.message.edit_text(
         f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
         f"Аккаунт: <b>{safe_html(session.label)}</b>\n\n"
-        f"Шаг 2 из 4. Выберите тип источника:",
+        f"Шаг 2 из 5. Выберите тип источника:",
         reply_markup=bridge_type_keyboard(),
     )
 
@@ -1369,15 +1408,62 @@ async def process_bridge_source(message: types.Message, state: FSMContext) -> No
     data = await state.get_data()
     source_input = normalize_source_input(message.text)
     selected_source_type = data.get("source_type", "channel")
+    selected_target_type = data.get("target_type", selected_source_type)
+    forum_mode = data.get("forum_mode")
     session_id = data.get("session_id")
 
     await state.update_data(source_input=source_input)
+
+    if selected_target_type == "forum" and forum_mode == "custom":
+        session = get_session(session_id)
+        if not session:
+            await message.answer(f"{EMOJI['error']} Аккаунт не найден", reply_markup=main_menu_keyboard())
+            await state.clear()
+            return
+
+        loading = await message.answer(f"{EMOJI['loading']} Проверяю источник...")
+        client = build_client(session)
+        try:
+            await client.connect()
+            manager = ChannelManager(client)
+            resolved = await manager.resolve_source(source_input)
+            if not resolved:
+                await loading.edit_text(
+                    f"{EMOJI['error']} Не удалось найти источник. Проверьте ссылку, ID и доступ.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                await state.clear()
+                return
+
+            source_id, resolved_type, source_title = resolved
+            if resolved_type not in {"channel", "chat"}:
+                await loading.edit_text(
+                    f"{EMOJI['error']} Для режима 'Создать свой форум' источник должен быть каналом или чатом.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                await state.clear()
+                return
+
+            await state.update_data(
+                source_id=source_id,
+                source_title=source_title,
+                resolved_source_type=resolved_type,
+            )
+            await state.set_state(BridgeCreateStates.selecting_filter)
+            await loading.edit_text(
+                f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+                f"Шаг 5 из 6. Выберите режим фильтрации:",
+                reply_markup=filter_type_keyboard(),
+            )
+        finally:
+            await client.disconnect()
+        return
 
     if selected_source_type != "forum":
         await state.set_state(BridgeCreateStates.selecting_filter)
         await message.answer(
             f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
-            f"Шаг 4 из 4. Выберите режим фильтрации:",
+            f"Шаг 5 из 5. Выберите режим фильтрации:",
             reply_markup=filter_type_keyboard(),
         )
         return
@@ -1403,6 +1489,13 @@ async def process_bridge_source(message: types.Message, state: FSMContext) -> No
             return
 
         source_id, resolved_type, source_title = resolved
+        if selected_target_type == "forum" and forum_mode == "mirror" and resolved_type != "forum":
+            await loading.edit_text(
+                f"{EMOJI['error']} Для режима 'Миррорить форум' источник должен быть форумом.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            return
         if resolved_type != "forum":
             await loading.edit_text(
                 f"{EMOJI['error']} Вы выбрали режим форума, но источник не является форумом.",
@@ -1429,6 +1522,17 @@ async def process_bridge_source(message: types.Message, state: FSMContext) -> No
             available_topics=topics,
             selected_topic_ids=list(selected_ids),
         )
+        if forum_mode == "mirror":
+            await state.set_state(BridgeCreateStates.selecting_filter)
+            await loading.edit_text(
+                f"{EMOJI['forum']} <b>Мирроринг форума</b>\n\n"
+                f"Источник: <b>{safe_html(source_title)}</b>\n"
+                f"Будут подключены все текущие ветки: {len(selected_ids)}\n\n"
+                f"Шаг 5 из 6. Выберите режим фильтрации:",
+                reply_markup=filter_type_keyboard(),
+            )
+            return
+
         await state.set_state(BridgeCreateStates.selecting_topics)
         await loading.edit_text(
             f"{EMOJI['forum']} <b>Выбор веток</b>\n\n"
@@ -1479,6 +1583,8 @@ async def create_bridge(message: types.Message, state: FSMContext) -> None:
     keywords = data.get("keywords", "")
     session_id = data.get("session_id")
     selected_source_type = data.get("source_type", "channel")  # User-selected type
+    selected_target_type = data.get("target_type", selected_source_type)
+    forum_mode = data.get("forum_mode")
     user_id = message.chat.id if hasattr(message, 'chat') else message.from_user.id
     
     if not all([source_input, session_id]):
@@ -1518,8 +1624,15 @@ async def create_bridge(message: types.Message, state: FSMContext) -> None:
         source_type = resolved_type
         if resolved_type != selected_source_type:
             logger.info(f"Type adjusted: selected={selected_source_type}, resolved={resolved_type}")
-        
-        result = await manager.create_target_for_source(source_title, source_type)
+        target_type = selected_target_type
+        if source_type == "forum":
+            target_type = "forum"
+
+        target_seed_title = source_title
+        if target_type == "forum" and forum_mode == "custom":
+            target_seed_title = data.get("custom_forum_title", source_title)
+
+        result = await manager.create_target_for_source(target_seed_title, target_type)
         if not result:
             await loading.edit_text(
                 f"{EMOJI['error']} Не удалось создать целевой чат для зеркала.",
@@ -1537,14 +1650,35 @@ async def create_bridge(message: types.Message, state: FSMContext) -> None:
             source_type=source_type,
             source_title=source_title,
             target_id=target_id,
-            target_type=source_type,
+            target_type=target_type,
             target_title=target_title,
             keywords=keywords,
         )
         
-        # If forum, create only selected topics
         topics_text = ""
-        if source_type == "forum":
+
+        # If target forum + custom mode, create one custom topic and bind source to it
+        if target_type == "forum" and forum_mode == "custom":
+            custom_topic_title = data.get("custom_forum_topic_title", "Новая ветка")
+            target_topic_id = await manager.create_target_topic(target_id, 0, custom_topic_title)
+            if target_topic_id:
+                add_topic_rule(
+                    bridge_id=bridge_id,
+                    source_chat_id=source_id,
+                    source_type=source_type,
+                    source_thread_id=0,
+                    source_title=source_title,
+                    target_chat_id=target_id,
+                    target_thread_id=target_topic_id,
+                    target_title=custom_topic_title,
+                    is_external=True,
+                )
+                topics_text = f"\n{EMOJI['forum']} Создана ветка: {safe_html(custom_topic_title)}"
+            else:
+                topics_text = f"\n{EMOJI['error']} Не удалось создать ветку {safe_html(custom_topic_title)}"
+
+        # If forum source, create selected source topics in target forum
+        if source_type == "forum" and forum_mode != "custom":
             available_topics = data.get("available_topics", [])
             selected_topic_ids = ensure_general_topic_selected(
                 available_topics,
@@ -1612,17 +1746,56 @@ async def create_bridge(message: types.Message, state: FSMContext) -> None:
 async def cb_select_bridge_type(callback: types.CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     bridge_type = callback.data.split(":")[1]
-    await state.update_data(source_type=bridge_type)
+    await state.update_data(source_type=bridge_type, target_type=bridge_type)
+
+    if bridge_type != "forum":
+        await state.set_state(BridgeCreateStates.selecting_target_type)
+        await callback.message.edit_text(
+            f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
+            f"Тип источника: {'Канал' if bridge_type == 'channel' else 'Чат'}\n\n"
+            f"Шаг 3 из 5. Выберите формат цели:",
+            reply_markup=target_type_keyboard(bridge_type),
+        )
+        return
+
+    await state.set_state(BridgeCreateStates.selecting_forum_mode)
+    await callback.message.edit_text(
+        f"{EMOJI['forum']} <b>Создание форум-зеркала</b>\n\n"
+        f"Тип источника: Форум\n"
+        f"Формат цели: Форум\n\n"
+        f"Шаг 3 из 5. Выберите режим:",
+        reply_markup=forum_mode_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("target_type:"))
+async def cb_select_target_type(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    target_type = callback.data.split(":")[1]
+    data = await state.get_data()
+    source_type = data.get("source_type", "channel")
+    if source_type == "forum":
+        target_type = "forum"
+    await state.update_data(target_type=target_type)
+
+    if target_type == "forum":
+        await state.set_state(BridgeCreateStates.selecting_forum_mode)
+        await callback.message.edit_text(
+            f"{EMOJI['forum']} <b>Создание форум-зеркала</b>\n\n"
+            f"Шаг 4 из 6. Выберите режим:",
+            reply_markup=forum_mode_keyboard(),
+        )
+        return
 
     hints = (
         f"• @channelname (публичный канал)\n"
         f"• https://t.me/c/1234567890/1 (ссылка на сообщение)\n"
         f"• -1001234567890 (ID канала)"
-        if bridge_type == "channel"
+        if source_type == "channel"
         else f"• Ссылка на форум или сообщение из форума\n"
         f"• https://t.me/c/1234567890/123\n"
         f"• -1001234567890 (ID форума)"
-        if bridge_type == "forum"
+        if source_type == "forum"
         else
         f"• Перешлите сообщение из чата\n"
         f"• https://t.me/c/1234567890/1 (ссылка из Web/Desktop)\n"
@@ -1632,9 +1805,82 @@ async def cb_select_bridge_type(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(BridgeCreateStates.entering_source)
     await callback.message.edit_text(
         f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
-        f"Тип: {'Канал' if bridge_type == 'channel' else 'Форум' if bridge_type == 'forum' else 'Чат'}\n\n"
-        f"Шаг 3 из 4. Отправьте источник\n\n"
+        f"Тип источника: {'Канал' if source_type == 'channel' else 'Форум' if source_type == 'forum' else 'Чат'}\n"
+        f"Формат цели: {'Канал' if target_type == 'channel' else 'Форум' if target_type == 'forum' else 'Чат'}\n\n"
+        f"Шаг 4 из 5. Отправьте источник\n\n"
         f"{hints}",
+        reply_markup=back_keyboard("main_menu"),
+    )
+
+
+@dp.callback_query(F.data.startswith("forum_mode:"))
+async def cb_select_forum_mode(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    mode = callback.data.split(":")[1]
+    data = await state.get_data()
+    source_type = data.get("source_type", "channel")
+    await state.update_data(forum_mode=mode)
+
+    if mode == "custom":
+        await state.set_state(BridgeCreateStates.entering_custom_forum_title)
+        await callback.message.edit_text(
+            f"{EMOJI['forum']} <b>Создать свой форум</b>\n\n"
+            f"Шаг 5 из 7. Введите название форума:",
+            reply_markup=back_keyboard("create_bridge"),
+        )
+        return
+
+    if source_type != "forum":
+        await callback.answer("Для этого режима источник должен быть форумом", show_alert=True)
+        return
+
+    hints = (
+        f"• Ссылка на форум или сообщение из форума\n"
+        f"• https://t.me/c/1234567890/123\n"
+        f"• -1001234567890 (ID форума)"
+    )
+    await state.set_state(BridgeCreateStates.entering_source)
+    await callback.message.edit_text(
+        f"{EMOJI['forum']} <b>Миррорить форум</b>\n\n"
+        f"Тип источника: Форум\n"
+        f"Формат цели: Форум\n\n"
+        f"Шаг 5 из 6. Отправьте источник форума\n\n"
+        f"{hints}",
+        reply_markup=back_keyboard("main_menu"),
+    )
+
+
+@dp.message(BridgeCreateStates.entering_custom_forum_title)
+async def process_custom_forum_title(message: types.Message, state: FSMContext) -> None:
+    forum_title = message.text.strip()
+    if not forum_title:
+        await message.answer("Введите название форума")
+        return
+    await state.update_data(custom_forum_title=forum_title)
+    await state.set_state(BridgeCreateStates.entering_custom_topic_title)
+    await message.answer(
+        f"{EMOJI['forum']} <b>Создать свой форум</b>\n\n"
+        f"Форум: <b>{safe_html(forum_title)}</b>\n\n"
+        f"Шаг 6 из 7. Введите название ветки, которую создать:",
+        reply_markup=back_keyboard("create_bridge"),
+    )
+
+
+@dp.message(BridgeCreateStates.entering_custom_topic_title)
+async def process_custom_forum_topic_title(message: types.Message, state: FSMContext) -> None:
+    topic_title = message.text.strip()
+    if not topic_title:
+        await message.answer("Введите название ветки")
+        return
+    await state.update_data(custom_forum_topic_title=topic_title)
+    await state.set_state(BridgeCreateStates.entering_source)
+    await message.answer(
+        f"{EMOJI['forum']} <b>Создать свой форум</b>\n\n"
+        f"Ветка: <b>{safe_html(topic_title)}</b>\n\n"
+        f"Шаг 7 из 7. Отправьте источник (канал или чат):\n"
+        f"• @channelname\n"
+        f"• https://t.me/c/1234567890/1\n"
+        f"• -1001234567890",
         reply_markup=back_keyboard("main_menu"),
     )
 
@@ -1681,9 +1927,17 @@ async def cb_create_topics_confirm(callback: types.CallbackQuery, state: FSMCont
         return
 
     await state.set_state(BridgeCreateStates.selecting_filter)
+    source_type = data.get("source_type", "channel")
+    forum_mode = data.get("forum_mode")
+    if source_type == "forum" and forum_mode == "mirror":
+        step_text = "Шаг 6 из 6. Настройте фильтр"
+    elif source_type == "forum":
+        step_text = "Шаг 4 из 4. Настройте фильтр"
+    else:
+        step_text = "Шаг 5 из 5. Настройте фильтр"
     await callback.message.edit_text(
         f"{EMOJI['mirror']} <b>Создание зеркала</b>\n\n"
-        f"Шаг 4 из 4. Настройте фильтр\n\n"
+        f"{step_text}\n\n"
         f"Выбрано веток: {len(selected_ids)}",
         reply_markup=filter_type_keyboard(),
     )
