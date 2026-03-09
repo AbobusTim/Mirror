@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 DB_PATH = Path("data/bridge.db")
+ROUTE_RELOAD_PATH = Path("data/route_reload.signal")
 
 
 @dataclass(frozen=True)
@@ -36,8 +37,44 @@ class UserSession:
     label: str  # User-friendly name for the session
 
 
+@dataclass(frozen=True)
+class TopicRule:
+    id: int
+    bridge_id: int
+    source_chat_id: int
+    source_type: str
+    source_thread_id: int
+    source_title: str
+    target_chat_id: int
+    target_thread_id: int
+    target_title: str
+    is_active: bool
+    is_external: bool
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class TopicProposal:
+    id: int
+    bridge_id: int
+    user_id: int
+    session_id: int
+    source_chat_id: int
+    source_thread_id: int
+    source_title: str
+    bridge_source_id: int
+    bridge_source_title: str
+    bridge_target_id: int
+    bridge_target_title: str
+    status: str
+    notified_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
 def init_db() -> None:
     DB_PATH.parent.mkdir(exist_ok=True)
+    ROUTE_RELOAD_PATH.parent.mkdir(exist_ok=True)
     with _get_connection() as conn:
         # Bridges table with session reference and forum support
         conn.execute(
@@ -105,7 +142,97 @@ def init_db() -> None:
             )
             """
         )
+        # Topic mapping table for forum bridges
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topic_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bridge_id INTEGER NOT NULL,
+                source_thread_id INTEGER NOT NULL,
+                target_thread_id INTEGER NOT NULL,
+                topic_title TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(bridge_id, source_thread_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topic_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bridge_id INTEGER NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('channel', 'chat', 'forum', 'topic')),
+                source_thread_id INTEGER DEFAULT 0,
+                source_title TEXT NOT NULL,
+                target_chat_id INTEGER NOT NULL,
+                target_thread_id INTEGER NOT NULL,
+                target_title TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                is_external BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(bridge_id, source_chat_id, source_thread_id, target_thread_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topic_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bridge_id INTEGER NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                source_thread_id INTEGER NOT NULL,
+                source_title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'accepted', 'dismissed')),
+                notified_at TIMESTAMP NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(bridge_id, source_chat_id, source_thread_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO topic_rules (
+                bridge_id,
+                source_chat_id,
+                source_type,
+                source_thread_id,
+                source_title,
+                target_chat_id,
+                target_thread_id,
+                target_title,
+                is_active,
+                is_external
+            )
+            SELECT
+                tm.bridge_id,
+                b.source_id,
+                'topic',
+                tm.source_thread_id,
+                COALESCE(NULLIF(tm.topic_title, ''), 'Topic ' || tm.source_thread_id),
+                b.target_id,
+                tm.target_thread_id,
+                COALESCE(NULLIF(tm.topic_title, ''), 'Topic ' || tm.source_thread_id),
+                1,
+                0
+            FROM topic_mappings tm
+            JOIN bridges b ON b.id = tm.bridge_id
+            """
+        )
         conn.commit()
+
+
+def notify_route_reload() -> None:
+    ROUTE_RELOAD_PATH.touch()
+
+
+def get_route_reload_token() -> float:
+    try:
+        return ROUTE_RELOAD_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
 
 
 @contextmanager
@@ -242,6 +369,7 @@ def add_bridge(
             (user_id, session_id, source_id, source_type, source_title, target_id, target_type, target_title, keywords, source_thread_id, target_thread_id),
         )
         conn.commit()
+        notify_route_reload()
         return cursor.lastrowid
 
 
@@ -279,8 +407,12 @@ def get_bridge_by_source(source_id: int) -> Optional[BridgeEntry]:
 
 def delete_bridge(bridge_id: int) -> bool:
     with _get_connection() as conn:
+        conn.execute("DELETE FROM topic_proposals WHERE bridge_id = ?", (bridge_id,))
+        conn.execute("DELETE FROM topic_rules WHERE bridge_id = ?", (bridge_id,))
+        conn.execute("DELETE FROM topic_mappings WHERE bridge_id = ?", (bridge_id,))
         cursor = conn.execute("DELETE FROM bridges WHERE id = ?", (bridge_id,))
         conn.commit()
+        notify_route_reload()
         return cursor.rowcount > 0
 
 
@@ -291,6 +423,7 @@ def toggle_bridge(bridge_id: int, is_active: bool) -> bool:
             (is_active, bridge_id),
         )
         conn.commit()
+        notify_route_reload()
         return cursor.rowcount > 0
 
 
@@ -323,3 +456,309 @@ def migrate_old_user_data(user_id: int) -> Optional[int]:
         )
         conn.commit()
         return cursor.lastrowid
+
+
+# Topic mapping for forum bridges
+
+def get_topic_mapping(bridge_id: int, source_thread_id: int) -> Optional[tuple[int, str]]:
+    """Get target thread ID and title for a source topic. Returns (target_thread_id, topic_title) or None."""
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT target_thread_id, topic_title FROM topic_mappings WHERE bridge_id = ? AND source_thread_id = ?",
+            (bridge_id, source_thread_id),
+        ).fetchone()
+        return (row["target_thread_id"], row["topic_title"]) if row else None
+
+
+def create_topic_mapping(
+    bridge_id: int, source_thread_id: int, target_thread_id: int, topic_title: str = ""
+) -> None:
+    """Create or update a topic mapping."""
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO topic_mappings (bridge_id, source_thread_id, target_thread_id, topic_title)
+            VALUES (?, ?, ?, ?)
+            """,
+            (bridge_id, source_thread_id, target_thread_id, topic_title),
+        )
+        conn.commit()
+        notify_route_reload()
+
+
+def get_all_topic_mappings(bridge_id: int) -> List[tuple[int, int, str]]:
+    """Get all topic mappings for a bridge. Returns list of (source_thread_id, target_thread_id, topic_title)."""
+    with _get_connection() as conn:
+        rows = conn.execute(
+            "SELECT source_thread_id, target_thread_id, topic_title FROM topic_mappings WHERE bridge_id = ?",
+            (bridge_id,),
+        ).fetchall()
+        return [(row["source_thread_id"], row["target_thread_id"], row["topic_title"]) for row in rows]
+
+
+def add_topic_rule(
+    bridge_id: int,
+    source_chat_id: int,
+    source_type: str,
+    source_thread_id: int,
+    source_title: str,
+    target_chat_id: int,
+    target_thread_id: int,
+    target_title: str,
+    is_external: bool = False,
+) -> int:
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR REPLACE INTO topic_rules (
+                bridge_id,
+                source_chat_id,
+                source_type,
+                source_thread_id,
+                source_title,
+                target_chat_id,
+                target_thread_id,
+                target_title,
+                is_active,
+                is_external
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                bridge_id,
+                source_chat_id,
+                source_type,
+                source_thread_id,
+                source_title,
+                target_chat_id,
+                target_thread_id,
+                target_title,
+                int(is_external),
+            ),
+        )
+        conn.commit()
+        notify_route_reload()
+        return cursor.lastrowid
+
+
+def get_topic_rule(rule_id: int) -> Optional[TopicRule]:
+    with _get_connection() as conn:
+        row = conn.execute("SELECT * FROM topic_rules WHERE id = ?", (rule_id,)).fetchone()
+        return TopicRule(**dict(row)) if row else None
+
+
+def get_topic_rules_for_bridge(bridge_id: int, active_only: bool = False) -> List[TopicRule]:
+    with _get_connection() as conn:
+        query = "SELECT * FROM topic_rules WHERE bridge_id = ?"
+        params: tuple[int, ...] = (bridge_id,)
+        if active_only:
+            query += " AND is_active = 1"
+        query += " ORDER BY created_at ASC"
+        rows = conn.execute(query, params).fetchall()
+        return [TopicRule(**dict(row)) for row in rows]
+
+
+def get_active_topic_rules() -> List[TopicRule]:
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT tr.*
+            FROM topic_rules tr
+            JOIN bridges b ON b.id = tr.bridge_id
+            WHERE tr.is_active = 1 AND b.is_active = 1
+            ORDER BY tr.created_at ASC
+            """
+        ).fetchall()
+        return [TopicRule(**dict(row)) for row in rows]
+
+
+def get_topic_rule_by_source(
+    bridge_id: int, source_chat_id: int, source_thread_id: int
+) -> Optional[TopicRule]:
+    with _get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM topic_rules
+            WHERE bridge_id = ? AND source_chat_id = ? AND source_thread_id = ?
+            """,
+            (bridge_id, source_chat_id, source_thread_id),
+        ).fetchone()
+        return TopicRule(**dict(row)) if row else None
+
+
+def toggle_topic_rule(rule_id: int, is_active: bool) -> bool:
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE topic_rules SET is_active = ? WHERE id = ?",
+            (is_active, rule_id),
+        )
+        conn.commit()
+        notify_route_reload()
+        return cursor.rowcount > 0
+
+
+def delete_topic_rule(rule_id: int) -> bool:
+    with _get_connection() as conn:
+        cursor = conn.execute("DELETE FROM topic_rules WHERE id = ?", (rule_id,))
+        conn.commit()
+        notify_route_reload()
+        return cursor.rowcount > 0
+
+
+def _topic_proposal_from_row(row) -> TopicProposal:
+    return TopicProposal(
+        id=row["id"],
+        bridge_id=row["bridge_id"],
+        user_id=row["user_id"],
+        session_id=row["session_id"],
+        source_chat_id=row["source_chat_id"],
+        source_thread_id=row["source_thread_id"],
+        source_title=row["source_title"],
+        bridge_source_id=row["bridge_source_id"],
+        bridge_source_title=row["bridge_source_title"],
+        bridge_target_id=row["bridge_target_id"],
+        bridge_target_title=row["bridge_target_title"],
+        status=row["status"],
+        notified_at=row["notified_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def get_topic_proposal(proposal_id: int) -> Optional[TopicProposal]:
+    with _get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                tp.*,
+                b.user_id,
+                b.session_id,
+                b.source_id AS bridge_source_id,
+                b.source_title AS bridge_source_title,
+                b.target_id AS bridge_target_id,
+                b.target_title AS bridge_target_title
+            FROM topic_proposals tp
+            JOIN bridges b ON b.id = tp.bridge_id
+            WHERE tp.id = ?
+            """,
+            (proposal_id,),
+        ).fetchone()
+        return _topic_proposal_from_row(row) if row else None
+
+
+def get_topic_proposal_by_source(
+    bridge_id: int,
+    source_chat_id: int,
+    source_thread_id: int,
+) -> Optional[TopicProposal]:
+    with _get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                tp.*,
+                b.user_id,
+                b.session_id,
+                b.source_id AS bridge_source_id,
+                b.source_title AS bridge_source_title,
+                b.target_id AS bridge_target_id,
+                b.target_title AS bridge_target_title
+            FROM topic_proposals tp
+            JOIN bridges b ON b.id = tp.bridge_id
+            WHERE tp.bridge_id = ? AND tp.source_chat_id = ? AND tp.source_thread_id = ?
+            """,
+            (bridge_id, source_chat_id, source_thread_id),
+        ).fetchone()
+        return _topic_proposal_from_row(row) if row else None
+
+
+def create_topic_proposal(
+    bridge_id: int,
+    source_chat_id: int,
+    source_thread_id: int,
+    source_title: str,
+) -> tuple[TopicProposal, bool]:
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO topic_proposals (
+                bridge_id,
+                source_chat_id,
+                source_thread_id,
+                source_title
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (bridge_id, source_chat_id, source_thread_id, source_title),
+        )
+        conn.commit()
+        row = conn.execute("SELECT changes() AS changes").fetchone()
+        proposal_row = conn.execute(
+            """
+            SELECT
+                tp.*,
+                b.user_id,
+                b.session_id,
+                b.source_id AS bridge_source_id,
+                b.source_title AS bridge_source_title,
+                b.target_id AS bridge_target_id,
+                b.target_title AS bridge_target_title
+            FROM topic_proposals tp
+            JOIN bridges b ON b.id = tp.bridge_id
+            WHERE tp.bridge_id = ? AND tp.source_chat_id = ? AND tp.source_thread_id = ?
+            """,
+            (bridge_id, source_chat_id, source_thread_id),
+        ).fetchone()
+        proposal = _topic_proposal_from_row(proposal_row) if proposal_row else None
+        if not proposal:
+            raise RuntimeError("Failed to load topic proposal after insert")
+        return proposal, bool(row["changes"])
+
+
+def mark_topic_proposal_notified(proposal_id: int) -> bool:
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE topic_proposals
+            SET notified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+            """,
+            (proposal_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def update_topic_proposal_status(proposal_id: int, status: str) -> bool:
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE topic_proposals
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, proposal_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_pending_topic_proposals_for_user(user_id: int) -> List[TopicProposal]:
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                tp.*,
+                b.user_id,
+                b.session_id,
+                b.source_id AS bridge_source_id,
+                b.source_title AS bridge_source_title,
+                b.target_id AS bridge_target_id,
+                b.target_title AS bridge_target_title
+            FROM topic_proposals tp
+            JOIN bridges b ON b.id = tp.bridge_id
+            WHERE b.user_id = ? AND tp.status = 'pending'
+            ORDER BY tp.created_at ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [_topic_proposal_from_row(row) for row in rows]
