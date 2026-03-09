@@ -15,7 +15,7 @@ from telethon import TelegramClient, events
 from telethon.errors import RPCError
 from telethon import functions
 from telethon.tl.functions.channels import CreateForumTopicRequest
-from telethon.tl.types import InputPeerChannel, PeerChannel
+from telethon.tl.types import InputPeerChannel, MessageMediaWebPage, PeerChannel
 from telethon.sessions import StringSession
 
 from src.database import (
@@ -324,19 +324,17 @@ class SessionWorker:
     @staticmethod
     def _get_event_source_thread_id(event: events.NewMessage.Event) -> int:
         message = event.message
-        for attr_name in ("reply_to_top_id", "top_msg_id"):
-            value = getattr(message, attr_name, None)
+        if not message.reply_to:
+            return 0
+
+        reply = message.reply_to
+        if not getattr(reply, "forum_topic", False):
+            return 0
+
+        for attr_name in ("reply_to_top_id", "top_msg_id", "reply_to_msg_id"):
+            value = getattr(reply, attr_name, None)
             if value:
                 return value
-
-        if message.reply_to:
-            for attr_name in ("reply_to_top_id", "top_msg_id", "reply_to_msg_id"):
-                value = getattr(message.reply_to, attr_name, None)
-                if value and (
-                    attr_name != "reply_to_msg_id"
-                    or getattr(message.reply_to, "forum_topic", False)
-                ):
-                    return value
         return 0
 
     async def _resolve_source_entity(self, source_chat_id: int):
@@ -565,16 +563,26 @@ class SessionWorker:
             logger.info(f"  Normalized source_chat={source_chat_id}, source_thread={source_thread_id}")
 
             incoming_text = event.raw_text or ""
-            has_media = event.message.media is not None
+            source_text = event.message.message or incoming_text or ""
+            is_webpage_preview = isinstance(event.message.media, MessageMediaWebPage)
+            has_media = event.message.media is not None and not is_webpage_preview
+            entities = getattr(event.message, "entities", None) or []
+            has_text = bool(source_text.strip())
+            has_entities = bool(has_text and entities)
 
-            logger.info(f"  Text length: {len(incoming_text)}, has_media: {has_media}")
+            logger.info(
+                f"  Text length: {len(source_text)}, has_media: {has_media}, "
+                f"is_webpage_preview: {is_webpage_preview}, entities: {len(entities)}, "
+                f"has_entities: {has_entities}"
+            )
 
-            if not incoming_text.strip() and not has_media:
+            if not has_text and not has_media:
                 logger.info(f"Session {self.session.session_id}: Skipped empty message from {source_id}")
                 return
 
             sender_header = await self._build_sender_header(event)
-            body_text = process_message(incoming_text)
+            body_plain = process_message(incoming_text)
+            body_with_entities = source_text
             direct_targets = self.direct_bridges.get(source_chat_id, [])
             topic_targets = list(self.topic_rules.get((source_chat_id, source_thread_id), []))
             if source_thread_id == 0:
@@ -584,42 +592,66 @@ class SessionWorker:
             for bridge in direct_targets:
                 keywords = parse_keywords(bridge.keywords)
                 logger.info(f"  Direct bridge {bridge.id} keywords: {keywords}")
-                if incoming_text.strip() and keywords and not contains_keywords(incoming_text, keywords):
+                if has_text and keywords and not contains_keywords(source_text, keywords):
                     logger.info(f"  Direct bridge {bridge.id} skipped by keywords")
                     continue
 
-                outgoing_text = f"{sender_header}\n\n{body_text}" if body_text else sender_header
                 if has_media:
                     await self.client.send_message(bridge.target_id, sender_header)
+                    file_kw = {}
+                    if has_entities and has_text:
+                        file_kw["formatting_entities"] = entities
                     await self.client.send_file(
                         bridge.target_id,
                         file=event.message.media,
-                        caption=body_text if incoming_text.strip() else None,
+                        caption=body_with_entities if has_text else None,
+                        **file_kw,
                     )
                 else:
-                    await self.client.send_message(bridge.target_id, outgoing_text)
+                    if has_entities and has_text:
+                        await self.client.send_message(bridge.target_id, sender_header)
+                        await self.client.send_message(
+                            bridge.target_id,
+                            body_with_entities,
+                            formatting_entities=entities,
+                        )
+                    else:
+                        outgoing_text = f"{sender_header}\n\n{body_plain}" if body_plain else sender_header
+                        await self.client.send_message(bridge.target_id, outgoing_text)
                 logger.info(f"Session {self.session.session_id}: ✅ Forwarded via direct bridge {bridge.id}")
                 routed = True
 
             for rule, bridge in topic_targets:
                 keywords = parse_keywords(bridge.keywords)
                 logger.info(f"  Topic rule {rule.id} keywords: {keywords}")
-                if incoming_text.strip() and keywords and not contains_keywords(incoming_text, keywords):
+                if has_text and keywords and not contains_keywords(source_text, keywords):
                     logger.info(f"  Topic rule {rule.id} skipped by keywords")
                     continue
 
                 send_kwargs = {"reply_to": rule.target_thread_id}
-                outgoing_text = f"{sender_header}\n\n{body_text}" if body_text else sender_header
                 if has_media:
                     await self.client.send_message(rule.target_chat_id, sender_header, **send_kwargs)
+                    file_kw = {"reply_to": rule.target_thread_id}
+                    if has_entities and has_text:
+                        file_kw["formatting_entities"] = entities
                     await self.client.send_file(
                         rule.target_chat_id,
                         file=event.message.media,
-                        caption=body_text if incoming_text.strip() else None,
-                        **send_kwargs,
+                        caption=body_with_entities if has_text else None,
+                        **file_kw,
                     )
                 else:
-                    await self.client.send_message(rule.target_chat_id, outgoing_text, **send_kwargs)
+                    if has_entities and has_text:
+                        await self.client.send_message(rule.target_chat_id, sender_header, **send_kwargs)
+                        await self.client.send_message(
+                            rule.target_chat_id,
+                            body_with_entities,
+                            formatting_entities=entities,
+                            **send_kwargs,
+                        )
+                    else:
+                        outgoing_text = f"{sender_header}\n\n{body_plain}" if body_plain else sender_header
+                        await self.client.send_message(rule.target_chat_id, outgoing_text, **send_kwargs)
                 logger.info(
                     f"Session {self.session.session_id}: ✅ Forwarded via topic rule {rule.id} "
                     f"to thread {rule.target_thread_id}"
