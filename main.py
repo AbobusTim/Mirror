@@ -155,7 +155,7 @@ class SessionWorker:
         self.direct_bridges = {}
         self.forum_bridges = {}
         for bridge in session_bridges:
-            if bridge.source_type in {"channel", "chat"}:
+            if bridge.source_type in {"channel", "chat"} and bridge.target_type != "forum":
                 self.direct_bridges.setdefault(bridge.source_id, []).append(bridge)
             elif bridge.source_type == "forum":
                 self.forum_bridges.setdefault(bridge.source_id, []).append(bridge)

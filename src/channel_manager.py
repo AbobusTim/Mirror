@@ -1,4 +1,5 @@
 import logging
+import asyncio
 
 from telethon import TelegramClient
 from telethon.tl.functions.channels import CreateChannelRequest, ToggleForumRequest
@@ -177,21 +178,29 @@ class ChannelManager:
 
     async def create_target_topic(self, target_id: int, source_topic_id: int, title: str) -> int | None:
         """Create a topic in target forum. Returns target_thread_id or None."""
-        try:
-            from telethon import functions
-            
-            channel_id = int(str(target_id).replace("-100", ""))
-            entity = await self.client.get_input_entity(PeerChannel(channel_id))
-            
-            result = await self.client(functions.channels.CreateForumTopicRequest(
-                channel=entity,
-                title=title,
-            ))
-            
-            target_thread_id = result.updates[0].id if result.updates else 1
-            logger.info(f"Created target topic '{title}' with ID {target_thread_id}")
-            return target_thread_id
-            
-        except Exception as e:
-            logger.exception(f"Failed to create topic '{title}' in target {target_id}: {e}")
-            return None
+        from telethon import functions
+
+        channel_id = int(str(target_id).replace("-100", ""))
+        last_error = None
+
+        # Telegram can return transient errors just after forum creation/toggle.
+        for attempt in range(1, 6):
+            try:
+                entity = await self.client.get_input_entity(PeerChannel(channel_id))
+                result = await self.client(functions.channels.CreateForumTopicRequest(
+                    channel=entity,
+                    title=title,
+                ))
+                target_thread_id = result.updates[0].id if result.updates else 1
+                logger.info(f"Created target topic '{title}' with ID {target_thread_id} (attempt {attempt})")
+                return target_thread_id
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Create topic attempt {attempt}/5 failed for target {target_id}, title '{title}': {e}"
+                )
+                if attempt < 5:
+                    await asyncio.sleep(1.5 * attempt)
+
+        logger.exception(f"Failed to create topic '{title}' in target {target_id}: {last_error}")
+        return None
