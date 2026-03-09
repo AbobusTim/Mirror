@@ -16,6 +16,7 @@ venv/
 # Data & Logs
 data/
 logs/
+.runtime/
 *.log
 *.db
 
