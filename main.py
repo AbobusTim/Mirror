@@ -3,6 +3,8 @@
 import asyncio
 import html
 import os
+import tempfile
+import time
 from typing import Dict, List, Set, Tuple
 
 from aiogram import Bot
@@ -12,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.errors import RPCError
+from telethon.errors import RPCError, UserAlreadyParticipantError
 from telethon import functions
 from telethon.tl.functions.channels import CreateForumTopicRequest
 from telethon.tl.types import InputPeerChannel, MessageMediaWebPage, PeerChannel
@@ -40,6 +42,11 @@ RECONNECT_DELAY = 5
 ROUTING_RELOAD_DELAY = 5
 SOURCE_POLL_DELAY = 5
 GENERAL_TOPIC_ID = 1
+MEDIA_MAX_SIZE_BYTES = 15 * 1024 * 1024
+MEDIA_TTL_SECONDS = 60 * 60
+MEDIA_CLEANUP_KEEP_FILES = 200
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEDIA_TEMP_DIR = os.path.join(BASE_DIR, ".runtime", "media-tmp")
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -62,6 +69,9 @@ class SessionWorker:
     def __init__(self, session: UserSession):
         self.session = session
         self.client: TelegramClient | None = None
+        self.sender_client: TelegramClient | None = None
+        self.bot_username: str | None = None
+        self.bot_target_access: Dict[int, bool] = {}
         self.bridges: Dict[int, BridgeEntry] = {}
         self.direct_bridges: Dict[int, List[BridgeEntry]] = {}
         self.forum_bridges: Dict[int, List[BridgeEntry]] = {}
@@ -93,6 +103,9 @@ class SessionWorker:
         if not await self.client.is_user_authorized():
             logger.error(f"Session {self.session.session_id}: Not authorized, skipping")
             return
+        os.makedirs(MEDIA_TEMP_DIR, exist_ok=True)
+        self._cleanup_temp_media_dir()
+        await self._init_sender_client()
 
         await self._load_bridges()
         await self._ensure_source_baselines()
@@ -114,6 +127,232 @@ class SessionWorker:
             logger.info(f"Session {self.session.session_id}: No bridges, disconnecting")
             await self.client.disconnect()
             await asyncio.sleep(30)
+
+    async def _init_sender_client(self) -> None:
+        """Initialize sender client. Prefer bot identity when BOT_TOKEN is set."""
+        if self.sender_client and self.sender_client is not self.client:
+            await self.sender_client.disconnect()
+
+        if not BOT_TOKEN:
+            self.sender_client = self.client
+            logger.warning("BOT_TOKEN is not set, sending via user account")
+            return
+
+        bot_client = TelegramClient(
+            StringSession(),
+            self.session.api_id,
+            self.session.api_hash,
+        )
+        await bot_client.connect()
+        await bot_client.start(bot_token=BOT_TOKEN)
+        self.sender_client = bot_client
+        bot_me = await bot_client.get_me()
+        self.bot_username = getattr(bot_me, "username", None)
+        logger.info(
+            f"Session {self.session.session_id}: Sender initialized as bot "
+            f"@{self.bot_username or 'unknown'}"
+        )
+
+    def _get_sender_client(self) -> TelegramClient:
+        return self.sender_client or self.client
+
+    async def _resolve_target_peer(self, target_id: int):
+        """Resolve target entity using user session cache for stable access_hash."""
+        sender = self._get_sender_client()
+        if sender is self.client:
+            return await self.client.get_input_entity(target_id)
+
+        if not await self._ensure_bot_target_access(target_id):
+            raise ValueError(
+                f"Bot has no access to target {target_id}. "
+                "Add bot to target and grant send permissions."
+            )
+        return await sender.get_input_entity(target_id)
+
+    async def _ensure_bot_target_access(self, target_id: int) -> bool:
+        if target_id in self.bot_target_access:
+            return self.bot_target_access[target_id]
+
+        sender = self._get_sender_client()
+        if sender is self.client:
+            self.bot_target_access[target_id] = True
+            return True
+
+        # Fast path: bot already has entity in cache/access.
+        try:
+            await sender.get_input_entity(target_id)
+            self.bot_target_access[target_id] = True
+            return True
+        except Exception:
+            pass
+
+        if not self.bot_username:
+            self.bot_target_access[target_id] = False
+            return False
+
+        # Attempt to invite bot from user session for channels/supergroups/forums.
+        try:
+            channel_entity = await self.client.get_input_entity(target_id)
+            await self.client(
+                functions.channels.InviteToChannelRequest(
+                    channel=channel_entity,
+                    users=[self.bot_username],
+                )
+            )
+        except UserAlreadyParticipantError:
+            pass
+        except Exception as e:
+            logger.warning(
+                f"Session {self.session.session_id}: Cannot auto-add bot to {target_id}: {e}"
+            )
+
+        try:
+            await sender.get_input_entity(target_id)
+            self.bot_target_access[target_id] = True
+            return True
+        except Exception as e:
+            self.bot_target_access[target_id] = False
+            logger.warning(
+                f"Session {self.session.session_id}: Bot still has no access to {target_id}: {e}"
+            )
+            return False
+
+    async def _send_text(
+        self,
+        target_id: int,
+        text: str,
+        entities=None,
+        reply_to: int | None = None,
+    ) -> None:
+        sender = self._get_sender_client()
+        target_peer = await self._resolve_target_peer(target_id)
+        kwargs = {}
+        if reply_to:
+            kwargs["reply_to"] = reply_to
+        if entities:
+            kwargs["formatting_entities"] = entities
+        # Keep links clickable but hide webpage preview banners.
+        kwargs["link_preview"] = False
+        await sender.send_message(target_peer, text, **kwargs)
+
+    async def _send_media(
+        self,
+        target_id: int,
+        message,
+        caption: str | None = None,
+        caption_entities=None,
+        reply_to: int | None = None,
+    ) -> None:
+        sender = self._get_sender_client()
+        target_peer = await self._resolve_target_peer(target_id)
+        file_info = getattr(message, "file", None)
+        media_size = getattr(file_info, "size", None)
+        if media_size and media_size > MEDIA_MAX_SIZE_BYTES:
+            logger.info(
+                f"Session {self.session.session_id}: Skip media >15MB, target={target_id}, "
+                f"message_id={getattr(message, 'id', 'unknown')}, size={media_size}"
+            )
+            if caption:
+                await self._send_text(target_id, caption, entities=caption_entities, reply_to=reply_to)
+            return
+
+        self._cleanup_temp_media_dir()
+        temp_file_path = await self.client.download_media(message, file=MEDIA_TEMP_DIR)
+        if not temp_file_path:
+            # Retry with explicit temp path for edge cases where directory download returns None.
+            suffix = ""
+            if file_info and getattr(file_info, "ext", None):
+                suffix = file_info.ext
+            fd, manual_path = tempfile.mkstemp(prefix="mirror-", suffix=suffix, dir=MEDIA_TEMP_DIR)
+            os.close(fd)
+            try:
+                retry_result = await self.client.download_media(message, file=manual_path)
+                if isinstance(retry_result, str) and os.path.exists(retry_result):
+                    temp_file_path = retry_result
+                elif os.path.exists(manual_path) and os.path.getsize(manual_path) > 0:
+                    temp_file_path = manual_path
+                else:
+                    os.remove(manual_path)
+            except Exception as e:
+                if os.path.exists(manual_path):
+                    os.remove(manual_path)
+                logger.warning(
+                    f"Session {self.session.session_id}: Media download retry failed: {e}"
+                )
+
+        if not temp_file_path:
+            logger.warning(
+                f"Session {self.session.session_id}: Media download returned empty result, "
+                f"target={target_id}, message_id={getattr(message, 'id', 'unknown')}"
+            )
+            if caption:
+                await self._send_text(target_id, caption, entities=caption_entities, reply_to=reply_to)
+            return
+
+        try:
+            kwargs = {}
+            if reply_to:
+                kwargs["reply_to"] = reply_to
+            if getattr(message, "voice", False):
+                kwargs["voice_note"] = True
+            if getattr(message, "video_note", False):
+                kwargs["video_note"] = True
+            if getattr(message, "video", False):
+                kwargs["supports_streaming"] = True
+
+            # Stickers do not support captions.
+            if not getattr(message, "sticker", False):
+                kwargs["caption"] = caption
+                if caption_entities:
+                    kwargs["formatting_entities"] = caption_entities
+
+            await sender.send_file(target_peer, file=temp_file_path, **kwargs)
+            logger.info(
+                f"Session {self.session.session_id}: Media sent by bot to {target_id}, "
+                f"message_id={getattr(message, 'id', 'unknown')}, file={temp_file_path}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Session {self.session.session_id}: Failed to send media to {target_id}: {e}"
+            )
+            if caption:
+                await self._send_text(target_id, caption, entities=caption_entities, reply_to=reply_to)
+        finally:
+            if isinstance(temp_file_path, str) and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
+                    logger.debug(f"Failed to remove temp media file: {temp_file_path}")
+
+    def _cleanup_temp_media_dir(self) -> None:
+        try:
+            if not os.path.isdir(MEDIA_TEMP_DIR):
+                return
+            now = time.time()
+            files = []
+            for name in os.listdir(MEDIA_TEMP_DIR):
+                path = os.path.join(MEDIA_TEMP_DIR, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                    files.append((mtime, path))
+                    if now - mtime > MEDIA_TTL_SECONDS:
+                        os.remove(path)
+                except Exception:
+                    continue
+
+            # Keep directory bounded even when TTL hasn't elapsed yet.
+            files = [(mtime, path) for mtime, path in files if os.path.exists(path)]
+            if len(files) > MEDIA_CLEANUP_KEEP_FILES:
+                files.sort()  # oldest first
+                for _, path in files[: len(files) - MEDIA_CLEANUP_KEEP_FILES]:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"Temp media cleanup failed: {e}")
 
     async def _periodic_reload_bridges(self) -> None:
         """Reload bridges every 30 seconds to catch new/deleted bridges."""
@@ -597,27 +836,24 @@ class SessionWorker:
                     continue
 
                 if has_media:
-                    await self.client.send_message(bridge.target_id, sender_header)
-                    file_kw = {}
-                    if has_entities and has_text:
-                        file_kw["formatting_entities"] = entities
-                    await self.client.send_file(
+                    await self._send_text(bridge.target_id, sender_header)
+                    await self._send_media(
                         bridge.target_id,
-                        file=event.message.media,
+                        event.message,
                         caption=body_with_entities if has_text else None,
-                        **file_kw,
+                        caption_entities=entities if has_entities and has_text else None,
                     )
                 else:
                     if has_entities and has_text:
-                        await self.client.send_message(bridge.target_id, sender_header)
-                        await self.client.send_message(
+                        await self._send_text(bridge.target_id, sender_header)
+                        await self._send_text(
                             bridge.target_id,
                             body_with_entities,
-                            formatting_entities=entities,
+                            entities=entities,
                         )
                     else:
                         outgoing_text = f"{sender_header}\n\n{body_plain}" if body_plain else sender_header
-                        await self.client.send_message(bridge.target_id, outgoing_text)
+                        await self._send_text(bridge.target_id, outgoing_text)
                 logger.info(f"Session {self.session.session_id}: ✅ Forwarded via direct bridge {bridge.id}")
                 routed = True
 
@@ -628,30 +864,54 @@ class SessionWorker:
                     logger.info(f"  Topic rule {rule.id} skipped by keywords")
                     continue
 
-                send_kwargs = {"reply_to": rule.target_thread_id}
+                include_header = bool(getattr(rule, "header_enabled", True))
                 if has_media:
-                    await self.client.send_message(rule.target_chat_id, sender_header, **send_kwargs)
-                    file_kw = {"reply_to": rule.target_thread_id}
-                    if has_entities and has_text:
-                        file_kw["formatting_entities"] = entities
-                    await self.client.send_file(
+                    if include_header:
+                        await self._send_text(
+                            rule.target_chat_id,
+                            sender_header,
+                            reply_to=rule.target_thread_id,
+                        )
+                    await self._send_media(
                         rule.target_chat_id,
-                        file=event.message.media,
+                        event.message,
                         caption=body_with_entities if has_text else None,
-                        **file_kw,
+                        caption_entities=entities if has_entities and has_text else None,
+                        reply_to=rule.target_thread_id,
                     )
                 else:
                     if has_entities and has_text:
-                        await self.client.send_message(rule.target_chat_id, sender_header, **send_kwargs)
-                        await self.client.send_message(
-                            rule.target_chat_id,
-                            body_with_entities,
-                            formatting_entities=entities,
-                            **send_kwargs,
-                        )
+                        if include_header:
+                            await self._send_text(
+                                rule.target_chat_id,
+                                sender_header,
+                                reply_to=rule.target_thread_id,
+                            )
+                            await self._send_text(
+                                rule.target_chat_id,
+                                body_with_entities,
+                                entities=entities,
+                                reply_to=rule.target_thread_id,
+                            )
+                        else:
+                            await self._send_text(
+                                rule.target_chat_id,
+                                body_with_entities,
+                                entities=entities,
+                                reply_to=rule.target_thread_id,
+                            )
                     else:
-                        outgoing_text = f"{sender_header}\n\n{body_plain}" if body_plain else sender_header
-                        await self.client.send_message(rule.target_chat_id, outgoing_text, **send_kwargs)
+                        if include_header:
+                            outgoing_text = (
+                                f"{sender_header}\n\n{body_plain}" if body_plain else sender_header
+                            )
+                        else:
+                            outgoing_text = body_plain
+                        await self._send_text(
+                            rule.target_chat_id,
+                            outgoing_text,
+                            reply_to=rule.target_thread_id,
+                        )
                 logger.info(
                     f"Session {self.session.session_id}: ✅ Forwarded via topic rule {rule.id} "
                     f"to thread {rule.target_thread_id}"
@@ -672,6 +932,8 @@ class SessionWorker:
 
     async def stop(self) -> None:
         """Stop the worker and disconnect."""
+        if self.sender_client and self.sender_client is not self.client:
+            await self.sender_client.disconnect()
         if self.client:
             await self.client.disconnect()
         self.running = False

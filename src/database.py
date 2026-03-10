@@ -50,6 +50,7 @@ class TopicRule:
     target_title: str
     is_active: bool
     is_external: bool
+    header_enabled: bool = True
     created_at: str = ""
 
 
@@ -170,11 +171,17 @@ def init_db() -> None:
                 target_title TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT 1,
                 is_external BOOLEAN DEFAULT 0,
+                header_enabled BOOLEAN DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(bridge_id, source_chat_id, source_thread_id, target_thread_id)
             )
             """
         )
+        try:
+            conn.execute("SELECT header_enabled FROM topic_rules LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE topic_rules ADD COLUMN header_enabled BOOLEAN DEFAULT 1")
+            conn.commit()
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS topic_proposals (
@@ -204,7 +211,8 @@ def init_db() -> None:
                 target_thread_id,
                 target_title,
                 is_active,
-                is_external
+                is_external,
+                header_enabled
             )
             SELECT
                 tm.bridge_id,
@@ -216,7 +224,8 @@ def init_db() -> None:
                 tm.target_thread_id,
                 COALESCE(NULLIF(tm.topic_title, ''), 'Topic ' || tm.source_thread_id),
                 1,
-                0
+                0,
+                1
             FROM topic_mappings tm
             JOIN bridges b ON b.id = tm.bridge_id
             """
@@ -520,9 +529,10 @@ def add_topic_rule(
                 target_thread_id,
                 target_title,
                 is_active,
-                is_external
+                is_external,
+                header_enabled
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1)
             """,
             (
                 bridge_id,
@@ -591,6 +601,17 @@ def toggle_topic_rule(rule_id: int, is_active: bool) -> bool:
         cursor = conn.execute(
             "UPDATE topic_rules SET is_active = ? WHERE id = ?",
             (is_active, rule_id),
+        )
+        conn.commit()
+        notify_route_reload()
+        return cursor.rowcount > 0
+
+
+def toggle_topic_rule_header(rule_id: int, header_enabled: bool) -> bool:
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE topic_rules SET header_enabled = ? WHERE id = ?",
+            (header_enabled, rule_id),
         )
         conn.commit()
         notify_route_reload()

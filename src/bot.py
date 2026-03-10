@@ -49,6 +49,7 @@ from src.database import (
     has_any_session,
     init_db,
     migrate_old_user_data,
+    toggle_topic_rule_header,
     toggle_topic_rule,
     toggle_bridge,
     update_topic_proposal_status,
@@ -292,11 +293,15 @@ def topic_editor_keyboard(bridge_id: int, rules: list[TopicRule]) -> InlineKeybo
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def topic_rule_detail_keyboard(bridge_id: int, rule_id: int, is_active: bool) -> InlineKeyboardMarkup:
+def topic_rule_detail_keyboard(
+    bridge_id: int, rule_id: int, is_active: bool, header_enabled: bool
+) -> InlineKeyboardMarkup:
     toggle_text = "🔴 Отключить ветку" if is_active else "🟢 Включить ветку"
+    header_text = "🙈 Выключить шапку" if header_enabled else "👤 Включить шапку"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle_topic_rule:{bridge_id}:{rule_id}")],
+            [InlineKeyboardButton(text=header_text, callback_data=f"toggle_topic_header:{bridge_id}:{rule_id}")],
             [InlineKeyboardButton(text=f"{EMOJI['deleted']} Удалить ветку", callback_data=f"delete_topic_rule:{bridge_id}:{rule_id}")],
             [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data=f"topic_editor:{bridge_id}")],
         ]
@@ -899,14 +904,18 @@ async def cb_topic_rule_detail(callback: types.CallbackQuery) -> None:
         return
 
     status = "🟢 Активна" if rule.is_active else "🔴 Выключена"
+    header_mode = "👤 Включена" if rule.header_enabled else "🙈 Выключена"
     source_kind = "Внешний источник" if rule.is_external else "Источник форума"
     await callback.message.edit_text(
         f"{EMOJI['forum']} <b>Ветка</b>\n\n"
         f"Статус: {status}\n"
+        f"Шапка: {header_mode}\n"
         f"Тип: {source_kind}\n"
         f"Источник: {rule.source_title}\n"
         f"Цель: {rule.target_title}",
-        reply_markup=topic_rule_detail_keyboard(bridge_id, rule.id, rule.is_active),
+        reply_markup=topic_rule_detail_keyboard(
+            bridge_id, rule.id, rule.is_active, rule.header_enabled
+        ),
     )
 
 
@@ -924,14 +933,53 @@ async def cb_toggle_topic_rule(callback: types.CallbackQuery, state: FSMContext)
         await callback.answer("Ветка не найдена", show_alert=True)
         return
     status = "🟢 Активна" if updated_rule.is_active else "🔴 Выключена"
+    header_mode = "👤 Включена" if updated_rule.header_enabled else "🙈 Выключена"
     source_kind = "Внешний источник" if updated_rule.is_external else "Источник форума"
     await callback.message.edit_text(
         f"{EMOJI['forum']} <b>Ветка</b>\n\n"
         f"Статус: {status}\n"
+        f"Шапка: {header_mode}\n"
         f"Тип: {source_kind}\n"
         f"Источник: {updated_rule.source_title}\n"
         f"Цель: {updated_rule.target_title}",
-        reply_markup=topic_rule_detail_keyboard(int(bridge_id_str), updated_rule.id, updated_rule.is_active),
+        reply_markup=topic_rule_detail_keyboard(
+            int(bridge_id_str),
+            updated_rule.id,
+            updated_rule.is_active,
+            updated_rule.header_enabled,
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("toggle_topic_header:"))
+async def cb_toggle_topic_header(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    _, bridge_id_str, rule_id_str = callback.data.split(":")
+    rule = get_topic_rule(int(rule_id_str))
+    if not rule:
+        await callback.answer("Ветка не найдена", show_alert=True)
+        return
+    toggle_topic_rule_header(rule.id, not rule.header_enabled)
+    updated_rule = get_topic_rule(int(rule_id_str))
+    if not updated_rule:
+        await callback.answer("Ветка не найдена", show_alert=True)
+        return
+    status = "🟢 Активна" if updated_rule.is_active else "🔴 Выключена"
+    header_mode = "👤 Включена" if updated_rule.header_enabled else "🙈 Выключена"
+    source_kind = "Внешний источник" if updated_rule.is_external else "Источник форума"
+    await callback.message.edit_text(
+        f"{EMOJI['forum']} <b>Ветка</b>\n\n"
+        f"Статус: {status}\n"
+        f"Шапка: {header_mode}\n"
+        f"Тип: {source_kind}\n"
+        f"Источник: {updated_rule.source_title}\n"
+        f"Цель: {updated_rule.target_title}",
+        reply_markup=topic_rule_detail_keyboard(
+            int(bridge_id_str),
+            updated_rule.id,
+            updated_rule.is_active,
+            updated_rule.header_enabled,
+        ),
     )
 
 
